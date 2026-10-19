@@ -37,8 +37,12 @@ class RunAs:
                 "LOGNAME": self.name, "LANG": os.environ.get("LANG", "C.UTF-8")}
 
     def subprocess_kwargs(self) -> dict:
-        return {"user": self.uid, "group": self.gid, "extra_groups": list(self.groups),
-                "env": self.env(), "cwd": "/"}
+        kw = {"env": self.env(), "cwd": "/"}
+        if os.geteuid() != self.uid:
+            # Switching users needs root. Already being that user (e.g. running
+            # 'netbird-nm doctor' without sudo) means there's nothing to switch.
+            kw.update(user=self.uid, group=self.gid, extra_groups=list(self.groups))
+        return kw
 
 
 class NetBird:

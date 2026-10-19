@@ -567,3 +567,17 @@ def test_custom_vpn_dir(installed):
     install("--vpn-dir", "/usr/lib/NetworkManager/VPN")
     assert not Path("/etc/NetworkManager/VPN/nm-netbird-service.name").exists()
     assert nm_up().returncode == 0
+
+
+def test_doctor_without_sudo(installed, tmp_path_factory):
+    """'netbird-nm doctor' run by the logged-in user itself (0.4.0 failed with EPERM)."""
+    copy = Path("/tmp/netbird-nm-doctor-test")
+    shutil.rmtree(copy, ignore_errors=True)
+    shutil.copytree(REPO, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+    sh("chmod", "-R", "a+rX", str(copy))
+    try:
+        r = sh("su", "-s", "/bin/sh", TEST_USER, "-c", f"cd {copy} && ./netbird-nm doctor")
+    finally:
+        shutil.rmtree(copy, ignore_errors=True)
+    assert "Operation not permitted" not in r.stdout + r.stderr
+    assert f"{TEST_USER} can reach the NetBird daemon" in r.stdout, r.stdout

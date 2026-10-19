@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+
+- **Fixed**: `netbird-nm doctor` run without sudo failed with "NetBird status
+  as <you> failed: [Errno 1] Operation not permitted". It tried to switch to
+  the logged-in user even when it already was that user, and switching users
+  needs root. The plugin itself (always root) was not affected.
+
 ## 0.4.0
 
 Two ideas borrowed from

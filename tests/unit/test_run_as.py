@@ -65,3 +65,17 @@ def test_summarize():
     assert summarize("a\n\n b \nc\n") == "a | b | c"
     long = "\n".join(str(i) for i in range(20))
     assert summarize(long, max_lines=3) == "0 | 1 | 2 | ... (17 more lines)"
+
+
+def test_no_switch_when_already_that_user(monkeypatch):
+    """'netbird-nm doctor' run by the user itself, without sudo (was EPERM)."""
+    me = RunAs.lookup(pwd.getpwuid(os.geteuid()).pw_name)
+    kw = me.subprocess_kwargs()
+    assert not {"user", "group", "extra_groups"} & kw.keys()
+    assert kw["env"]["USER"] == me.name
+
+
+def test_switch_when_different_user(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    kw = RunAs.lookup("nobody").subprocess_kwargs()
+    assert kw["user"] == NOBODY.pw_uid and kw["group"] == NOBODY.pw_gid
