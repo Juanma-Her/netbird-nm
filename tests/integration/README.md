@@ -1,9 +1,15 @@
 # Integration tests
 
 `test_live.py` installs netbird-nm into a real NetworkManager and drives it
-the way a user (or Quickshell, through `nmcli`) would, with
-[`fake-netbird`](fake-netbird) standing in for NetBird: `up` creates a TUN
-interface called `wt0` with a 100.x address, `down` removes it.
+the way a user (or Quickshell, through `nmcli`) would. NetBird is replaced by
+two fakes with the same split as the real thing:
+[`fake-netbirdd`](fake-netbirdd), a root daemon on a unix socket that creates
+and removes a TUN interface `wt0` with a 100.x address, and
+[`fake-netbird`](fake-netbird), a CLI that only sends it commands, so it can
+run as an ordinary user. The daemon logs each caller's uid, which is how the
+tests prove `netbird` runs as the configured user (`nbtest`, created by the
+tests). The daemon can also be told to fail `up`, or to bring the interface up
+late, through files in `/tmp/fake-netbird`.
 
 They start, stop and reconfigure NetworkManager, so **only run them in a
 disposable root container or VM**, never on your desktop.
@@ -33,5 +39,10 @@ What's covered:
 - the exact `nmcli` calls the Quickshell bar makes, including `nmcli monitor`
 - `status`, `doctor --live`, uninstall, and upgrading from the shell script
   in [`legacy/`](legacy/)
+- `netbird` running as the configured user, and as root with `--as-root`
+- a slow first connection (address after 30s), and a failure that explains
+  itself in the log
+- NetBird left running without its address (NetworkManager removes it when
+  the VPN goes down) being repaired on connect and after network changes
 
-The suite takes about three and a half minutes.
+The suite takes about six minutes.

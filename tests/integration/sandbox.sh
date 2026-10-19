@@ -5,6 +5,8 @@
 # it starts its own system D-Bus and NetworkManager. Existing interfaces are
 # marked unmanaged so the container's own networking is left alone, and a TUN
 # device stands in for Wi-Fi/ethernet as the connection the VPN rides on.
+# NetworkManager runs with the same sandboxing as its systemd unit (read-only
+# home and /usr, reduced capabilities); NM_SANDBOX_HARDEN=0 turns that off.
 #
 #   sandbox.sh deps          install packages (Debian/Ubuntu)
 #   sandbox.sh start         start D-Bus + NetworkManager + the base connection
@@ -25,8 +27,23 @@ start_dbus() {
 }
 
 start_nm() {
-    setsid NetworkManager --no-daemon --log-level=DEBUG \
-        --log-domains=VPN,VPN_PLUGIN,CORE,DEVICE,DISPATCH >> "$LOG" 2>&1 < /dev/null &
+    if [ "${NM_SANDBOX_HARDEN:-1}" = 1 ]; then
+        # Run NetworkManager under the same limits as its systemd unit
+        # (NetworkManager.service): ProtectHome=read-only, ProtectSystem=true
+        # and its CapabilityBoundingSet. The VPN plugin and everything it
+        # starts inherit these, exactly as on a desktop.
+        setsid unshare --mount --propagation private sh -c '
+            for d in /home /root /run/user /usr /boot; do
+                [ -d "$d" ] || continue
+                mount --bind "$d" "$d" && mount -o remount,bind,ro "$d"
+            done
+            exec setpriv --bounding-set -all,+net_admin,+dac_override,+net_raw,+net_bind_service,+setgid,+setuid,+sys_module,+audit_write,+kill,+sys_chroot \
+                NetworkManager --no-daemon --log-level=DEBUG \
+                --log-domains=VPN,VPN_PLUGIN,CORE,DEVICE,DISPATCH' >> "$LOG" 2>&1 < /dev/null &
+    else
+        setsid NetworkManager --no-daemon --log-level=DEBUG \
+            --log-domains=VPN,VPN_PLUGIN,CORE,DEVICE,DISPATCH >> "$LOG" 2>&1 < /dev/null &
+    fi
     i=0
     until nmcli -t general status >/dev/null 2>&1; do
         i=$((i + 1)); [ $i -gt 30 ] && { echo "NetworkManager didn't start; see $LOG" >&2; exit 1; }

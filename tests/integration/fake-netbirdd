@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Stand-in for the NetBird daemon in integration tests. Runs as root and
+listens on a unix socket, like the real one; the fake CLI (fake-netbird) only
+sends it commands, so the CLI can run as an ordinary user.
+
+  up      create TUN interface $FAKE_NETBIRD_IFACE (wt0) with 100.92.1.5/16
+  down    remove it
+  status  report it
+
+The state directory holds:
+  log    one line per command: time, caller uid, command
+  fail   if present, "up" fails like a logged-out client
+  slow   if present, its number is how many seconds the interface takes to
+         appear after "up" returns (like a slow first connection)
+"""
+
+import json
+import os
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+SOCK = os.environ.get("FAKE_NETBIRD_SOCK", "/run/fake-netbird.sock")
+STATE = Path(os.environ.get("FAKE_NETBIRD_STATE", "/tmp/fake-netbird"))
+IFACE = os.environ.get("FAKE_NETBIRD_IFACE", "wt0")
+pending: list = []          # a delayed interface creation, cancelled by "down"
+
+
+def sh(*cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def exists():
+    return Path("/sys/class/net", IFACE).exists()
+
+
+def create_iface():
+    if not exists():
+        sh("ip", "tuntap", "add", "dev", IFACE, "mode", "tun")
+    sh("ip", "addr", "replace", "100.92.1.5/16", "dev", IFACE)
+    sh("ip", "link", "set", IFACE, "up")
+
+
+def handle(cmd):
+    if cmd == "up":
+        if (STATE / "fail").exists():
+            return 1, "", "Error: not logged in, run netbird login\n"
+        if exists():
+            return 0, "Already connected\n", ""
+        time.sleep(1)
+        delay = float((STATE / "slow").read_text() or 0) if (STATE / "slow").exists() else 0
+        if delay:
+            t = threading.Timer(delay, create_iface)
+            pending.append(t)
+            t.start()
+        else:
+            create_iface()
+        return 0, "Connected\n", ""
+    if cmd == "down":
+        while pending:
+            pending.pop().cancel()
+        time.sleep(1)
+        sh("ip", "link", "del", IFACE)
+        return 0, "Disconnected\n", ""
+    if cmd == "status":
+        state = "Connected" if exists() else "Disconnected"
+        return 0, f"Management: {state}\nSignal: {state}\n", ""
+    return 2, "", f"unsupported command {cmd}\n"
+
+
+def serve(conn):
+    with conn:
+        creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", creds)
+        cmd = conn.recv(1024).decode().strip()
+        STATE.mkdir(parents=True, exist_ok=True)
+        with open(STATE / "log", "a") as f:
+            f.write(f"{time.strftime('%T')} uid={uid} {cmd}\n")
+        rc, out, err = handle(cmd)
+        conn.sendall(json.dumps({"rc": rc, "out": out, "err": err}).encode())
+
+
+def main():
+    STATE.mkdir(parents=True, exist_ok=True)
+    if os.path.exists(SOCK):
+        os.unlink(SOCK)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK)
+    os.chmod(SOCK, 0o666)        # like NetBird: ordinary users may control it
+    srv.listen(8)
+    print(f"fake netbird daemon on {SOCK}", file=sys.stderr, flush=True)
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,35 +1,37 @@
-#!/bin/sh
-# Stand-in for the netbird CLI in integration tests: "up" creates a TUN
-# interface with a 100.x address, "down" removes it.
-#   FAKE_NETBIRD_IFACE  interface name (default wt0)
-#   $STATE/fail         if present, "up" fails like a logged-out client
-#   $STATE/log          every call is appended here with a timestamp
-STATE=${FAKE_NETBIRD_STATE:-/tmp/fake-netbird}
-IF=${FAKE_NETBIRD_IFACE:-wt0}
-mkdir -p "$STATE"
-echo "$(date +%T.%N | cut -c1-12) $*" >> "$STATE/log"
+#!/usr/bin/env python3
+"""Stand-in for the netbird CLI: forwards its command to fake-netbirdd over a
+unix socket and prints the answer, so it works as any user, like the real CLI."""
 
-case "$1" in
-    up)
-        if [ -e "$STATE/fail" ]; then
-            echo "Error: not logged in, run netbird login" >&2
-            exit 1
-        fi
-        sleep 1
-        ip link show "$IF" >/dev/null 2>&1 || ip tuntap add dev "$IF" mode tun
-        ip addr replace 100.92.1.5/16 dev "$IF"
-        ip link set "$IF" up
-        echo "Connected" ;;
-    down)
-        sleep 1
-        ip link del "$IF" 2>/dev/null
-        echo "Disconnected" ;;
-    status)
-        if ip link show "$IF" >/dev/null 2>&1; then echo "Management: Connected"
-        else echo "Daemon status: Idle"; fi ;;
-    version)
-        echo "0.0.0-fake" ;;
-    *)
-        echo "fake-netbird: unsupported command $1" >&2
-        exit 2 ;;
-esac
+import json
+import os
+import socket
+import sys
+
+SOCK = os.environ.get("FAKE_NETBIRD_SOCK", "/run/fake-netbird.sock")
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "version":
+        print("0.0.0-fake")
+        return 0
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK)
+    except OSError as e:
+        print(f"failed to connect to daemon error: {e}", file=sys.stderr)
+        return 1
+    with s:
+        s.sendall(cmd.encode())
+        s.shutdown(socket.SHUT_WR)
+        data = b""
+        while chunk := s.recv(65536):
+            data += chunk
+    reply = json.loads(data)
+    sys.stdout.write(reply["out"])
+    sys.stderr.write(reply["err"])
+    return reply["rc"]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

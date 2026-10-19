@@ -21,8 +21,11 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 CLI = [sys.executable, str(REPO / "netbird-nm")]
 SANDBOX = ["sh", str(HERE / "sandbox.sh")]
-FAKE_NETBIRD = str(HERE / "fake-netbird")
+# The fakes get copied somewhere every user can execute them.
+FAKE_DIR = Path("/usr/local/lib/netbird-nm-test")
+FAKE_NETBIRD = str(FAKE_DIR / "fake-netbird")
 FAKE_STATE = Path("/tmp/fake-netbird")
+TEST_USER = "nbtest"          # an ordinary user; the plugin runs netbird as this user
 CONFIG = Path("/etc/netbird-nm.json")
 SERVICE = "org.freedesktop.NetworkManager.netbird"
 
@@ -56,6 +59,10 @@ def tunnel() -> str:
     return "up" if Path("/sys/class/net/wt0").exists() else "down"
 
 
+def has_ipv4() -> bool:
+    return "inet " in sh("ip", "-4", "-o", "addr", "show", "dev", "wt0").stdout
+
+
 def wait_for(pred, timeout: float, step: float = 0.5) -> bool:
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -75,7 +82,8 @@ os.environ.setdefault("NETBIRD_NM_RESTART_CMD", " ".join(SANDBOX + ["restart-nm"
 
 
 def install(*extra: str) -> subprocess.CompletedProcess[str]:
-    r = sh(*CLI, "install", "--netbird", FAKE_NETBIRD, "-y", *extra)
+    who = [] if {"--user", "--as-root"} & set(extra) else ["--user", TEST_USER]
+    r = sh(*CLI, "install", "--netbird", FAKE_NETBIRD, "-y", *who, *extra)
     assert r.returncode == 0, r.stdout + r.stderr
     return r
 
@@ -94,6 +102,19 @@ def fake_netbird(cmd: str) -> None:
     sh(FAKE_NETBIRD, cmd, check=True)
 
 
+def daemon_log() -> list[str]:
+    try:
+        return (FAKE_STATE / "log").read_text().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def reset_fake_state() -> None:
+    FAKE_STATE.mkdir(exist_ok=True)
+    for f in FAKE_STATE.iterdir():
+        f.unlink()
+
+
 def speed_up_timers() -> None:
     """Shorter dispatcher delays so the suite runs in reasonable time."""
     cfg = json.loads(CONFIG.read_text())
@@ -106,14 +127,24 @@ def speed_up_timers() -> None:
 @pytest.fixture(scope="module", autouse=True)
 def sandbox():
     sh(*SANDBOX, "start", check=True)
+    if sh("id", TEST_USER).returncode != 0:
+        sh("useradd", "--create-home", TEST_USER, check=True)
+    FAKE_DIR.mkdir(parents=True, exist_ok=True)
+    for name in ("fake-netbird", "fake-netbirdd"):
+        shutil.copy(HERE / name, FAKE_DIR / name)
+        (FAKE_DIR / name).chmod(0o755)
+    daemon = subprocess.Popen([sys.executable, str(FAKE_DIR / "fake-netbirdd")],
+                              stderr=subprocess.DEVNULL, start_new_session=True)
+    assert wait_for(lambda: Path("/run/fake-netbird.sock").exists(), 10)
     yield
     sh(*CLI, "uninstall")
     sh("ip", "link", "del", "wt0")
+    daemon.terminate()
 
 
 @pytest.fixture
 def installed():
-    shutil.rmtree(FAKE_STATE, ignore_errors=True)
+    reset_fake_state()
     sh("ip", "link", "del", "wt0")
     base("up")
     install()
@@ -121,8 +152,9 @@ def installed():
     yield
     nm_down()
     sh(*CLI, "uninstall")
+    reset_fake_state()
+    sh(FAKE_NETBIRD, "down")      # also cancels a delayed interface from a "slow" test
     sh("ip", "link", "del", "wt0")
-    shutil.rmtree(FAKE_STATE, ignore_errors=True)
 
 
 # -- the bug that started this: plugin dir not watched by NM ---------------------------
@@ -302,6 +334,7 @@ def test_uninstall_leaves_netbird_running_and_cleans_up(installed):
     uninstall()
     time.sleep(4)
     assert tunnel() == "up", "uninstall must not cut the user's NetBird"
+    assert has_ipv4(), "NetBird must keep its address, not just its interface"
     assert "NetBird" not in sh("nmcli", "-t", "-f", "NAME", "connection", "show").stdout
     for path in ("/usr/local/libexec/nm-netbird-service", "/etc/netbird-nm.json",
                  "/usr/lib/NetworkManager/VPN/nm-netbird-service.name",
@@ -331,3 +364,80 @@ def test_upgrade_from_shell_version(installed):
     assert rows.count("vpn:NetBird") == 1, "the existing connection is kept, not duplicated"
     assert nm_up().returncode == 0
     settle("activated", "up")
+
+
+# -- 0.2.1 -----------------------------------------------------------------------------
+
+def uid_of(user: str) -> int:
+    import pwd
+    return pwd.getpwnam(user).pw_uid
+
+
+def test_netbird_runs_as_the_configured_user(installed):
+    """Connect and disconnect both reach the daemon as the ordinary user, not root."""
+    assert nm_up().returncode == 0
+    settle("activated", "up")
+    nm_down()
+    settle("inactive", "down")
+    calls = [ln for ln in daemon_log() if ln.endswith((" up", " down"))]
+    assert calls and all(f"uid={uid_of(TEST_USER)} " in ln for ln in calls), calls
+
+
+def test_as_root_option(installed):
+    install("--as-root")
+    assert json.loads(CONFIG.read_text())["user"] == ""
+    reset_fake_state()
+    assert nm_up().returncode == 0
+    settle("activated", "up")
+    assert any(ln.endswith("uid=0 up") for ln in daemon_log()), daemon_log()
+
+
+def test_slow_first_connection_still_succeeds(installed):
+    """The interface appearing 30s after 'netbird up' returned (0.2 gave up after 20s)."""
+    (FAKE_STATE / "slow").write_text("30")
+    r = nm_up()
+    assert r.returncode == 0, r.stderr
+    settle("activated", "up")
+
+
+def test_failure_explains_itself_in_the_log(installed):
+    """When the interface never appears, the log says what NetBird reported."""
+    log = Path(os.environ.get("NM_SANDBOX_LOG", "/tmp/nm-sandbox.log"))
+    start = log.stat().st_size
+    (FAKE_STATE / "slow").write_text("90")              # longer than the whole budget
+    r = nm_up()
+    assert r.returncode != 0
+    with open(log, errors="replace") as f:
+        f.seek(start)
+        new = f.read()
+    assert "netbird up said: Connected" in new
+    assert "netbird status: Management: Disconnected" in new
+    assert "IPv4 addresses:" in new
+    settle("inactive", "down")
+
+
+def test_doctor_checks_the_user(installed):
+    out = sh(*CLI, "doctor").stdout
+    assert f"netbird runs as {TEST_USER} and reaches the NetBird daemon" in out
+
+
+def test_connects_when_netbird_was_left_without_its_address(installed):
+    """The first failure seen on a real machine: NetBird still running from
+    before, but NetworkManager had removed its address, so 'netbird up' said
+    "Already connected" and the interface never got an address."""
+    fake_netbird("up")
+    sh("ip", "-4", "addr", "flush", "dev", "wt0")
+    assert tunnel() == "up" and not has_ipv4()
+    r = nm_up()
+    assert r.returncode == 0, r.stderr
+    settle("activated", "up")
+    assert has_ipv4()
+
+
+def test_network_change_keeps_address_after_resume(installed):
+    nm_up()
+    settle("activated", "up")
+    base("down")
+    base("up")
+    settle("activated", "up", timeout=40)
+    assert has_ipv4()
