@@ -13,9 +13,11 @@ from .const import CONFIG_PATH, DEFAULT_IFACE, MARKER, STATE_DIR
 @dataclass
 class Config:
     netbird: str = "/usr/bin/netbird"   # absolute path; NM runs us with a minimal PATH
+    user: str = ""                      # run the netbird CLI as this user ("" = root)
     iface: str = DEFAULT_IFACE          # NetBird's WireGuard interface
     state_dir: str = STATE_DIR
-    up_timeout: float = 50.0            # NM gives a VPN 60s to come up by default
+    connect_timeout: float = 55.0       # 'netbird up' + the address showing up; NM gives up at 60s
+    up_timeout: float = 50.0            # the 'netbird up' command alone
     down_grace: float = 2.0             # how long a disconnect waits for a "network change" flag
     watch_interval: int = 3             # seconds between checks that NetBird is still up
     adopt_delay: float = 8.0            # after a network comes up, before adopting a running NetBird

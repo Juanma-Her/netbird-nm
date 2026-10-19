@@ -26,6 +26,7 @@ from .installer import (
     dispatcher_service_enabled,
     find_python,
 )
+from .netbird import RunAs
 from .nmcli import Nmcli
 
 SRC_DIR = str(Path(__file__).resolve().parent.parent)
@@ -101,13 +102,17 @@ def cmd_install(args: argparse.Namespace, inst: Installer) -> int:
 
     try:
         res = inst.install(InstallOptions(name=args.name, iface=args.iface,
-                                          netbird=args.netbird, python=python,
+                                          netbird=args.netbird, python=python, user=args.user,
                                           restart_nm=bool(restart)))
     except RuntimeError as e:
         err(str(e))
         return 1
 
     say(f"netbird: {res['netbird']}   interface: {res['iface']}   python: {res['python']}")
+    say(f"'netbird up/down' will run as: {res['user'] or 'root'}")
+    if res.get("user_check"):
+        warn(f"'netbird status' failed as {res['user']}: {res['user_check']}. If your user can't "
+             "control NetBird, reinstall with --as-root.")
     for item in res["legacy"]:
         say(f"Removed leftover from an earlier version: {item}")
     say(f"Plugin registered in {res['vpn_dir']}")
@@ -141,6 +146,8 @@ def cmd_uninstall(args: argparse.Namespace, inst: Installer) -> int:
         say(f"Removed {path}")
     for path in res["skipped"]:
         warn(f"{path} wasn't created by netbird-nm; left in place")
+    if res.get("restored_netbird"):
+        say("Restarted NetBird so it keeps its address (NetworkManager removes it with the VPN)")
     if not (res["profiles"] or res["removed"]):
         say("Nothing to remove")
     say("Done. NetBird itself is untouched"
@@ -180,6 +187,15 @@ def cmd_doctor(args: argparse.Namespace, inst: Installer) -> int:
     check(nm.running(), "NetworkManager is running", "NetworkManager isn't running")
     check(os.access(cfg.netbird, os.X_OK), f"netbird found at {cfg.netbird}",
           f"netbird not found at {cfg.netbird} (reinstall with --netbird PATH)")
+    if cfg.user:
+        try:
+            problem = inst.check_user_can_reach_netbird(cfg.netbird, RunAs.lookup(cfg.user))
+        except KeyError:
+            problem = "that user doesn't exist"
+        check(not problem, f"netbird runs as {cfg.user} and reaches the NetBird daemon",
+              f"'netbird status' as {cfg.user} failed: {problem} (reinstall with --user or --as-root)")
+    else:
+        print("  ..  netbird runs as root (reinstall with --user NAME to run it as your user)")
     plugin = L.p(L.plugin_bin)
     check(plugin.exists(), f"plugin installed at {plugin}", "plugin missing; run install")
     if plugin.exists():
@@ -232,6 +248,11 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--iface", help="NetBird's interface (default: from /etc/netbird/config.json, else wt0)")
     i.add_argument("--netbird", help="path to the netbird binary (default: from PATH)")
     i.add_argument("--python", help="Python interpreter for the plugin (default: auto-detect)")
+    who = i.add_mutually_exclusive_group()
+    who.add_argument("--user", help="run the netbird command as this user "
+                                    "(default: you, when installing through sudo)")
+    who.add_argument("--as-root", dest="user", action="store_const", const="",
+                     help="run the netbird command as root")
     i.add_argument("--no-deps", action="store_true", help="don't install missing Python bindings")
     g = i.add_mutually_exclusive_group()
     g.add_argument("--restart-nm", dest="restart_nm", action="store_true", default=None,

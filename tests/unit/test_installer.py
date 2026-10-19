@@ -348,3 +348,40 @@ def test_restart_reports_failure(monkeypatch):
     assert installer.restart_networkmanager() is False
     monkeypatch.setenv("NETBIRD_NM_RESTART_CMD", "true")
     assert installer.restart_networkmanager() is True
+
+
+# -- 0.2.1: which user runs netbird ---------------------------------------------------------
+
+def test_pick_user_precedence(root, monkeypatch):
+    inst = make(root)
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    assert inst.pick_user(None) == ""                     # plain root shell, nothing installed
+    monkeypatch.setenv("SUDO_USER", "nobody")
+    assert inst.pick_user(None) == "nobody"               # installed through sudo
+    assert inst.pick_user("") == ""                       # --as-root wins
+    assert inst.pick_user("daemon") == "daemon"           # --user wins
+    monkeypatch.setenv("SUDO_USER", "root")
+    assert inst.pick_user(None) == ""
+
+
+def test_pick_user_keeps_earlier_choice_on_reinstall(root, fake_netbird, monkeypatch):
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    inst = make(root)
+    inst.install(opts(fake_netbird, user="nobody"))
+    assert inst.pick_user(None) == "nobody"
+
+
+def test_install_records_user(root, fake_netbird):
+    make(root).install(opts(fake_netbird, user="nobody"))
+    assert Config.load(root / "etc/netbird-nm.json").user == "nobody"
+
+
+def test_install_rejects_unknown_user(root, fake_netbird):
+    with pytest.raises(RuntimeError, match="no-such-user-xyz"):
+        make(root).install(opts(fake_netbird, user="no-such-user-xyz"))
+
+
+def test_older_config_without_user_means_root(tmp_path):
+    path = tmp_path / "c.json"
+    path.write_text('{"netbird": "/usr/bin/netbird", "iface": "wt0"}')
+    assert Config.load(path).user == ""

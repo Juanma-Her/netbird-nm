@@ -18,6 +18,7 @@ from typing import Callable
 
 from .config import Config
 from .const import LEGACY_MARKER, MARKER, SERVICE
+from .netbird import NetBird, RunAs
 from .nmcli import Nmcli
 from .state import StateDir
 
@@ -230,6 +231,7 @@ class InstallOptions:
     iface: str | None = None
     netbird: str | None = None
     python: str | None = None
+    user: str | None = None          # run the netbird CLI as this user; "" = root, None = pick
     restart_nm: bool = False         # restart NM if it can't see the plugin otherwise
     manage_system: bool = True       # reload D-Bus/NM, enable dispatcher; off in tests
 
@@ -328,6 +330,28 @@ class Installer:
             raise RuntimeError(f"nmcli could not create the connection: {r.stderr.strip()}")
         return "created"
 
+    def pick_user(self, requested: str | None) -> str:
+        """Who runs the netbird CLI: --user / --as-root, else whoever ran the
+        installer through sudo, else what an earlier install chose, else root."""
+        if requested is not None:
+            return requested
+        sudo_user = os.environ.get("SUDO_USER", "")
+        if sudo_user and sudo_user != "root":
+            return sudo_user
+        return Config.load(self.layout.p(self.layout.config)).user
+
+    @staticmethod
+    def check_user_can_reach_netbird(netbird: str, run_as: RunAs) -> str:
+        """'' if '<user> netbird status' works, else the problem."""
+        try:
+            r = NetBird(netbird, run_as=run_as).status(timeout=15)
+        except (OSError, subprocess.SubprocessError) as e:
+            return str(e)
+        if r.returncode != 0:
+            lines = (r.stderr or r.stdout or "").strip().splitlines()
+            return lines[-1] if lines else f"exit code {r.returncode}"
+        return ""
+
     def install(self, opts: InstallOptions) -> dict:
         from .config import detect_iface
 
@@ -338,9 +362,17 @@ class Installer:
         python = opts.python or find_python()
         if not python:
             raise RuntimeError("no Python with the libnm GObject bindings was found")
-        cfg = Config(netbird=netbird, iface=opts.iface or detect_iface())
+        user = self.pick_user(opts.user)
+        if user:
+            try:
+                run_as = RunAs.lookup(user)
+            except KeyError:
+                raise RuntimeError(f"user {user!r} doesn't exist") from None
+        cfg = Config(netbird=netbird, user=user, iface=opts.iface or detect_iface())
 
-        result: dict = {"netbird": netbird, "python": python, "iface": cfg.iface}
+        result: dict = {"netbird": netbird, "python": python, "iface": cfg.iface, "user": user}
+        if user and opts.manage_system:
+            result["user_check"] = self.check_user_can_reach_netbird(netbird, run_as)
         result["legacy"] = [str(p) for p in self.remove_legacy()]
         if self.remove_legacy_dummy(opts.name):
             result["legacy"].append(f"dummy connection '{opts.name}'")
@@ -386,6 +418,8 @@ class Installer:
                     break
                 time.sleep(0.5)
             subprocess.run(["pkill", "-f", L.plugin_bin], capture_output=True)
+            if keep_netbird and result["profiles"]:
+                result["restored_netbird"] = self.restore_netbird_address(cfg)
 
         paths = [L.p(x) for x in (L.plugin_bin, L.config, L.dispatcher, L.dbus_conf,
                                   L.unmanaged_conf)]
@@ -409,6 +443,30 @@ class Installer:
             reload_dbus()
             self.nm.reload_conf()
         return result
+
+    @staticmethod
+    def restore_netbird_address(cfg: Config, wait: float = 3.0) -> bool:
+        """Taking the VPN down makes NetworkManager remove NetBird's address
+        from its interface. When NetBird is meant to keep running, restart it
+        so it gets the address back. True if it had to."""
+        from .controller import make_netbird
+        from .netbird import iface_exists, iface_ipv4
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:          # NM strips it shortly after 'down'
+            if not iface_exists(cfg.iface):
+                return False                        # NetBird wasn't running
+            if not iface_ipv4(cfg.iface):
+                break
+            time.sleep(0.5)
+        else:
+            return False                            # address still there
+        try:
+            nb = make_netbird(cfg)
+        except KeyError:
+            nb = NetBird(cfg.netbird)
+        nb.down()
+        nb.up(timeout=cfg.up_timeout)
+        return True
 
     # -- status ------------------------------------------------------------------
     def status(self) -> dict:
