@@ -204,9 +204,75 @@ def test_install_is_idempotent(root, fake_netbird):
     assert before == after and len(nm.profiles) == 1
 
 
-def test_install_requires_netbird(root, tmp_path):
+def test_cli_backend_requires_netbird(root, tmp_path):
     with pytest.raises(RuntimeError, match="netbird not found"):
-        make(root).install(opts(str(tmp_path / "nope")))
+        make(root).install(opts(str(tmp_path / "nope"), backend="cli"))
+
+
+def test_grpc_backend_does_not_need_the_cli(root, tmp_path, monkeypatch):
+    monkeypatch.setattr("netbird_nm.installer.has_grpc", lambda py: True)
+    res = make(root).install(opts(str(tmp_path / "nope")))
+    assert res["backend"] == "grpc"
+
+
+def test_backend_is_grpc_when_available(root, fake_netbird, monkeypatch):
+    monkeypatch.setattr("netbird_nm.installer.has_grpc", lambda py: True)
+    make(root).install(opts(fake_netbird))
+    assert Config.load(root / "etc/netbird-nm.json").backend == "grpc"
+
+
+def test_backend_falls_back_to_cli(root, fake_netbird, monkeypatch):
+    monkeypatch.setattr("netbird_nm.installer.has_grpc", lambda py: False)
+    make(root).install(opts(fake_netbird))
+    assert Config.load(root / "etc/netbird-nm.json").backend == "cli"
+
+
+def test_forcing_grpc_without_grpcio_fails(root, fake_netbird, monkeypatch):
+    monkeypatch.setattr("netbird_nm.installer.has_grpc", lambda py: False)
+    with pytest.raises(RuntimeError, match="grpcio"):
+        make(root).install(opts(fake_netbird, backend="grpc"))
+
+
+def test_has_grpc(runner):
+    runner.on(["/py/a"], returncode=0).on(["/py/b"], returncode=1)
+    from netbird_nm.installer import has_grpc
+    assert has_grpc("/py/a", runner) and not has_grpc("/py/b", runner)
+
+
+def test_daemon_addr_is_recorded_and_kept(root, fake_netbird):
+    inst = make(root)
+    inst.install(opts(fake_netbird, daemon_addr="unix:///run/custom.sock"))
+    inst.install(opts(fake_netbird))
+    assert Config.load(root / "etc/netbird-nm.json").daemon_addr == "unix:///run/custom.sock"
+
+
+# -- --vpn-dir ---------------------------------------------------------------------------------
+
+def test_custom_vpn_dir(root, fake_netbird):
+    inst = make(root)
+    res = inst.install(opts(fake_netbird, vpn_dir="/opt/nm/VPN"))
+    custom = root / "opt/nm/VPN/nm-netbird-service.name"
+    assert custom.exists() and res["needs_restart"] is True      # NM doesn't watch a new dir
+    assert not (root / "usr/lib/NetworkManager/VPN/nm-netbird-service.name").exists()
+    assert inst.installed_name_file() == custom
+    inst.install(opts(fake_netbird))                               # reinstall keeps it
+    assert custom.exists()
+    inst.uninstall(manage_system=False)
+    assert not custom.exists()
+
+
+def test_existing_custom_vpn_dir_needs_no_restart(root, fake_netbird):
+    (root / "opt/nm/VPN").mkdir(parents=True)
+    res = make(root).install(opts(fake_netbird, vpn_dir="/opt/nm/VPN"))
+    assert res["needs_restart"] is False
+
+
+def test_moving_back_from_custom_vpn_dir(root, fake_netbird):
+    inst = make(root)
+    inst.install(opts(fake_netbird, vpn_dir="/opt/nm/VPN"))
+    inst.install(opts(fake_netbird, vpn_dir="/usr/lib/NetworkManager/VPN"))
+    assert not (root / "opt/nm/VPN/nm-netbird-service.name").exists()
+    assert (root / "usr/lib/NetworkManager/VPN/nm-netbird-service.name").exists()
 
 
 def test_install_moves_name_file_out_of_unwatched_etc(root, fake_netbird):

@@ -18,16 +18,17 @@ from pathlib import Path
 from . import __version__
 from .config import Config
 from .const import SERVICE
-from .controller import resolve_user
+from .controller import make_netbird, resolve_user
 from .installer import (
+    GRPC_DEPS,
     Installer,
     InstallOptions,
     Layout,
     deps_command,
     dispatcher_service_enabled,
     find_python,
+    has_grpc,
 )
-from .netbird import RunAs
 from .nmcli import Nmcli
 
 SRC_DIR = str(Path(__file__).resolve().parent.parent)
@@ -101,7 +102,22 @@ def cmd_install(args: argparse.Namespace, inst: Installer) -> int:
             err("the libnm bindings still can't be imported")
             return 1
 
-    _, needs_restart = inst.choose_vpn_dir()
+    backend = args.backend
+    if backend != "cli" and not has_grpc(python):
+        cmd = deps_command(GRPC_DEPS)
+        want = backend == "grpc"
+        if cmd and not args.no_deps and (args.yes or ask(
+                "Talking to NetBird's daemon directly needs Python's grpcio (recommended). "
+                f"Install it with '{' '.join(cmd)}'? (No: use the netbird command instead)", True)):
+            say("Installing grpcio: " + " ".join(cmd))
+            subprocess.run(cmd)
+        if not has_grpc(python):
+            if want:
+                err("the grpc backend needs grpcio (python-grpcio)")
+                return 1
+            backend = "cli"
+
+    _, needs_restart = inst.choose_vpn_dir(args.vpn_dir)
     restart = args.restart_nm
     if needs_restart and restart is None:
         restart = args.yes or ask(
@@ -111,12 +127,15 @@ def cmd_install(args: argparse.Namespace, inst: Installer) -> int:
     try:
         res = inst.install(InstallOptions(name=args.name, iface=args.iface,
                                           netbird=args.netbird, python=python, run_as=args.run_as,
-                                          restart_nm=bool(restart)))
+                                          backend=backend, daemon_addr=args.daemon_addr,
+                                          vpn_dir=args.vpn_dir, restart_nm=bool(restart)))
     except RuntimeError as e:
         err(str(e))
         return 1
 
-    say(f"netbird: {res['netbird']}   interface: {res['iface']}   python: {res['python']}")
+    say(f"interface: {res['iface']}   python: {res['python']}")
+    say("talks to NetBird " + ("directly over its daemon's gRPC socket" if res["backend"] == "grpc"
+                               else f"through the netbird command ({res['netbird']})"))
     say("'netbird up/down' will run as: " + describe_run_as(res["run_as"], res["user_now"]))
     if res.get("user_check"):
         warn(f"'netbird status' failed as {res['user_now']}: {res['user_check']}. If that user "
@@ -193,17 +212,28 @@ def cmd_doctor(args: argparse.Namespace, inst: Installer) -> int:
     nm = inst.nm
     cfg = Config.load(L.p(L.config))
     check(nm.running(), "NetworkManager is running", "NetworkManager isn't running")
-    check(os.access(cfg.netbird, os.X_OK), f"netbird found at {cfg.netbird}",
-          f"netbird not found at {cfg.netbird} (reinstall with --netbird PATH)")
+    lib = str(L.p(L.lib_dir))
+    plugin_python = None
+    if L.p(L.plugin_bin).exists():
+        plugin_python = L.p(L.plugin_bin).read_text().splitlines()[0][2:]
+    if cfg.backend == "grpc":
+        check(plugin_python is None or has_grpc(plugin_python),
+              f"talks to NetBird's daemon over gRPC ({cfg.daemon_addr})",
+              f"{plugin_python} can't import grpcio (install python-grpcio, or reinstall "
+              "with --backend cli)")
+    else:
+        check(os.access(cfg.netbird, os.X_OK), f"uses the netbird command at {cfg.netbird}",
+              f"netbird not found at {cfg.netbird} (reinstall with --netbird PATH)")
     now = resolve_user(cfg)
-    print("  ..  netbird runs as: " + describe_run_as(cfg.run_as, now))
-    if now:
-        try:
-            problem = inst.check_user_can_reach_netbird(cfg.netbird, RunAs.lookup(now))
-        except KeyError:
-            problem = "that user doesn't exist"
-        check(not problem, f"{now} can reach the NetBird daemon",
-              f"'netbird status' as {now} failed: {problem} (reinstall with --as-root?)")
+    print("  ..  NetBird is controlled as: " + describe_run_as(cfg.run_as, now))
+    try:
+        nb = make_netbird(cfg, now, python=plugin_python, lib=lib)
+        problem = inst.check_user_can_reach_netbird(nb)
+    except KeyError:
+        problem = "that user doesn't exist"
+    who = now or "root"
+    check(not problem, f"{who} can reach the NetBird daemon",
+          f"NetBird status as {who} failed: {problem}")
     plugin = L.p(L.plugin_bin)
     check(plugin.exists(), f"plugin installed at {plugin}", "plugin missing; run install")
     if plugin.exists():
@@ -264,7 +294,15 @@ def build_parser() -> argparse.ArgumentParser:
                      help="always run the netbird command as root")
     who.add_argument("--session-user", dest="run_as", action="store_const", const="session",
                      help="go back to the default after --user or --as-root")
-    i.add_argument("--no-deps", action="store_true", help="don't install missing Python bindings")
+    i.add_argument("--no-deps", action="store_true", help="don't install missing Python packages")
+    i.add_argument("--backend", choices=("grpc", "cli"),
+                   help="talk to NetBird's daemon directly (grpc, needs python-grpcio) or run the "
+                        "netbird command (cli). Default: grpc when grpcio is available")
+    i.add_argument("--daemon-addr", metavar="ADDR",
+                   help="NetBird daemon socket (default: unix:///var/run/netbird.sock)")
+    i.add_argument("--vpn-dir", metavar="DIR",
+                   help="NetworkManager VPN plugin directory (default: /usr/lib/NetworkManager/VPN "
+                        "if it exists, else /etc/NetworkManager/VPN)")
     g = i.add_mutually_exclusive_group()
     g.add_argument("--restart-nm", dest="restart_nm", action="store_true", default=None,
                    help="restart NetworkManager if needed, without asking")

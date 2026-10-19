@@ -114,3 +114,35 @@ def test_install_asks_before_installing_bindings(tmp_path, monkeypatch, capsys):
     assert cli.cmd_install(cli.build_parser().parse_args(["install"]), inst) == 1
     assert ran == []
     assert "libnm bindings" in capsys.readouterr().err
+
+
+def test_install_falls_back_to_cli_when_grpcio_declined(tmp_path, monkeypatch):
+    seen = {}
+
+    class Inst(Installer):
+        def install(self, opts):
+            seen["backend"] = opts.backend
+            raise RuntimeError("stop here")
+
+    monkeypatch.setattr(cli, "find_python", lambda: sys.executable)
+    monkeypatch.setattr(cli, "has_grpc", lambda py: False)
+    monkeypatch.setattr(cli, "deps_command", lambda table=None: ["pacman", "-S", "python-grpcio"])
+    monkeypatch.setattr(cli, "ask", lambda q, default: False)
+    (tmp_path / "usr/lib/NetworkManager/VPN").mkdir(parents=True)
+    cli.cmd_install(cli.build_parser().parse_args(["install"]), Inst(Layout(root=tmp_path), StubNM()))
+    assert seen["backend"] == "cli"
+
+
+def test_install_forced_grpc_without_grpcio_fails(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "find_python", lambda: sys.executable)
+    monkeypatch.setattr(cli, "has_grpc", lambda py: False)
+    monkeypatch.setattr(cli, "deps_command", lambda table=None: None)
+    inst = Installer(Layout(root=tmp_path), StubNM())
+    assert cli.cmd_install(cli.build_parser().parse_args(["install", "--backend", "grpc"]), inst) == 1
+    assert "grpcio" in capsys.readouterr().err
+
+
+def test_new_install_options_parse():
+    a = cli.build_parser().parse_args(["install", "--backend", "cli", "--daemon-addr", "unix:///x",
+                                       "--vpn-dir", "/etc/NetworkManager/VPN"])
+    assert (a.backend, a.daemon_addr, a.vpn_dir) == ("cli", "unix:///x", "/etc/NetworkManager/VPN")

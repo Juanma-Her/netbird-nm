@@ -161,11 +161,27 @@ DEPS = {
 }
 
 
-def deps_command() -> list[str] | None:
-    for tool, cmd in DEPS.items():
+GRPC_DEPS = {
+    "pacman": ["pacman", "-S", "--needed", "--noconfirm", "python-grpcio"],
+    "apt-get": ["apt-get", "install", "-y", "python3-grpcio"],
+    "dnf": ["dnf", "install", "-y", "python3-grpcio"],
+    "zypper": ["zypper", "--non-interactive", "install", "python3-grpcio"],
+    "xbps-install": ["xbps-install", "-y", "python3-grpcio"],
+}
+
+
+def deps_command(table: dict[str, list[str]] = DEPS) -> list[str] | None:
+    for tool, cmd in table.items():
         if shutil.which(tool):
             return cmd
     return None
+
+
+def has_grpc(python: str, runner=subprocess.run) -> bool:
+    try:
+        return runner([python, "-c", "import grpc"], capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def nm_start_time() -> float | None:
@@ -232,6 +248,9 @@ class InstallOptions:
     netbird: str | None = None
     python: str | None = None
     run_as: str | None = None        # "session", "root" or a user name; None = keep / default
+    backend: str | None = None       # "grpc" or "cli"; None = grpc when grpcio is available
+    daemon_addr: str | None = None   # NetBird daemon socket; None = keep / default
+    vpn_dir: str | None = None       # where NM's plugin description goes; None = automatic
     restart_nm: bool = False         # restart NM if it can't see the plugin otherwise
     manage_system: bool = True       # reload D-Bus/NM, enable dispatcher; off in tests
 
@@ -245,19 +264,31 @@ class Installer:
         self.warn = warn
 
     # -- choosing where the plugin description goes -------------------------
-    def choose_vpn_dir(self) -> tuple[Path, bool]:
+    def choose_vpn_dir(self, override: str | None = None) -> tuple[Path, bool]:
         """(directory, needs_nm_restart).
 
         Prefer a directory that already exists (NM watches it); if none does,
         create the first one, and NM has to be restarted to notice it."""
+        if override:
+            path = self.layout.p(override)
+            return path, not path.is_dir()
         for d in self.layout.vpn_dirs:
             path = self.layout.p(d)
             if path.is_dir():
                 return path, False
         return self.layout.p(self.layout.vpn_dirs[0]), True
 
+    def name_files(self) -> list[Path]:
+        """Where a plugin description of ours may be: the standard directories,
+        plus a --vpn-dir recorded by an earlier install."""
+        files = self.layout.name_file_candidates()
+        recorded = Config.load(self.layout.p(self.layout.config)).vpn_dir
+        if recorded:
+            files.append(self.layout.p(recorded) / self.layout.name_file_name)
+        return list(dict.fromkeys(files))
+
     def installed_name_file(self) -> Path | None:
-        for f in self.layout.name_file_candidates():
+        for f in self.name_files():
             if f.exists() and is_ours(f, (MARKER,)):
                 return f
         return None
@@ -291,8 +322,10 @@ class Installer:
         return False
 
     # -- install ---------------------------------------------------------------
-    def install_files(self, cfg: Config, python: str) -> tuple[Path, bool]:
+    def install_files(self, cfg: Config, python: str, vpn_dir_override: str | None = None
+                      ) -> tuple[Path, bool]:
         L = self.layout
+        old_name_files = self.name_files()      # before the config (and a --vpn-dir) changes
         # the package itself
         lib = L.p(L.lib_dir)
         pkg = lib / "netbird_nm"
@@ -309,10 +342,17 @@ class Installer:
         write(L.p(L.dbus_conf), dbus_policy(), 0o644)
         write(L.p(L.unmanaged_conf), unmanaged_conf(cfg.iface), 0o644)
 
-        vpn_dir, needs_restart = self.choose_vpn_dir()
-        for other in L.name_file_candidates():
+        vpn_dir, needs_restart = self.choose_vpn_dir(vpn_dir_override)
+        moved = False
+        for other in old_name_files + self.name_files():
             if other.parent != vpn_dir and other.exists() and is_ours(other):
                 other.unlink()
+                moved = True
+        if moved and L.root == Path("/"):
+            # NM watches each plugin directory separately and may see the new
+            # file before the old one's removal; it then ignores the new one
+            # as a duplicate and unregisters the plugin when the removal lands.
+            time.sleep(1.5)
         write(vpn_dir / L.name_file_name, name_file(L.plugin_bin), 0o644)
         return vpn_dir, needs_restart
 
@@ -338,10 +378,10 @@ class Installer:
         return Config.load(self.layout.p(self.layout.config)).run_as
 
     @staticmethod
-    def check_user_can_reach_netbird(netbird: str, run_as: RunAs) -> str:
-        """'' if '<user> netbird status' works, else the problem."""
+    def check_user_can_reach_netbird(nb: NetBird) -> str:
+        """'' if 'netbird status' works as nb's user, else the problem."""
         try:
-            r = NetBird(netbird, run_as=run_as).status(timeout=15)
+            r = nb.status(timeout=15)
         except (OSError, subprocess.SubprocessError) as e:
             return str(e)
         if r.returncode != 0:
@@ -352,14 +392,18 @@ class Installer:
     def install(self, opts: InstallOptions) -> dict:
         from .config import detect_iface
 
-        netbird = opts.netbird or shutil.which("netbird") or "/usr/bin/netbird"
-        if not os.access(netbird, os.X_OK):
-            raise RuntimeError(f"netbird not found ({netbird}); install NetBird first "
-                               "or pass --netbird PATH")
         python = opts.python or find_python()
         if not python:
             raise RuntimeError("no Python with the libnm GObject bindings was found")
-        from .controller import resolve_user
+        previous = Config.load(self.layout.p(self.layout.config))
+        backend = opts.backend or ("grpc" if has_grpc(python) else "cli")
+        if backend == "grpc" and not has_grpc(python):
+            raise RuntimeError(f"the grpc backend needs grpcio for {python} (python-grpcio)")
+        netbird = opts.netbird or shutil.which("netbird") or "/usr/bin/netbird"
+        if backend == "cli" and not os.access(netbird, os.X_OK):
+            raise RuntimeError(f"netbird not found ({netbird}); install NetBird first "
+                               "or pass --netbird PATH")
+        from .controller import make_netbird, resolve_user
 
         run_as = self.pick_run_as(opts.run_as)
         if run_as not in ("session", "root"):
@@ -367,21 +411,27 @@ class Installer:
                 RunAs.lookup(run_as)
             except KeyError:
                 raise RuntimeError(f"user {run_as!r} doesn't exist") from None
-        cfg = Config(netbird=netbird, run_as=run_as, iface=opts.iface or detect_iface())
+        cfg = Config(netbird=netbird, run_as=run_as, iface=opts.iface or detect_iface(),
+                     backend=backend, daemon_addr=opts.daemon_addr or previous.daemon_addr)
 
-        # Who that means right now (for "session": whoever is logged in).
-        now = resolve_user(cfg)
+        now = resolve_user(cfg)          # for "session": whoever is logged in right now
         result: dict = {"netbird": netbird, "python": python, "iface": cfg.iface,
-                        "run_as": run_as, "user_now": now}
-        if now and opts.manage_system:
-            result["user_check"] = self.check_user_can_reach_netbird(netbird, RunAs.lookup(now))
+                        "run_as": run_as, "user_now": now, "backend": backend}
         result["legacy"] = [str(p) for p in self.remove_legacy()]
         if self.remove_legacy_dummy(opts.name):
             result["legacy"].append(f"dummy connection '{opts.name}'")
 
-        vpn_dir, needs_restart = self.install_files(cfg, python)
+        if opts.vpn_dir:
+            cfg.vpn_dir = opts.vpn_dir
+        elif previous.vpn_dir and self.layout.p(previous.vpn_dir).is_dir():
+            cfg.vpn_dir = previous.vpn_dir          # keep an earlier --vpn-dir
+        vpn_dir, needs_restart = self.install_files(cfg, python, cfg.vpn_dir or None)
         result["vpn_dir"] = str(vpn_dir)
         result["needs_restart"] = needs_restart
+        if now and opts.manage_system:
+            # through the installed copy, the way the plugin will run it
+            nb = make_netbird(cfg, now, python=python, lib=str(self.layout.p(self.layout.lib_dir)))
+            result["user_check"] = self.check_user_can_reach_netbird(nb)
 
         if opts.manage_system:
             reload_dbus()
@@ -425,7 +475,7 @@ class Installer:
 
         paths = [L.p(x) for x in (L.plugin_bin, L.config, L.dispatcher, L.dbus_conf,
                                   L.unmanaged_conf)]
-        paths += L.name_file_candidates()
+        paths += self.name_files()
         paths += [L.p(x) for x in L.legacy.values()]
         for path in dict.fromkeys(paths):
             if not path.exists():

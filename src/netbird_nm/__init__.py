@@ -1,3 +1,3 @@
 """Control NetBird from NetworkManager as if it were a regular VPN."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
