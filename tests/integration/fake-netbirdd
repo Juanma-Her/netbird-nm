@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Stand-in for the NetBird daemon in integration tests. Runs as root and
-listens on a unix socket, like the real one; the fake CLI (fake-netbird) only
-sends it commands, so the CLI can run as an ordinary user.
+"""Stand-in for the NetBird daemon in tests: a gRPC server speaking the parts
+of NetBird's DaemonService that netbird-nm uses (Status, GetActiveProfile,
+Login, Up, Down, GetConfig), on a unix socket like the real one.
 
-  up      create TUN interface $FAKE_NETBIRD_IFACE (wt0) with 100.92.1.5/16
-  down    remove it
-  status  report it
+Callers are identified the way NetBird does it, by the socket's peer
+credentials: clients connect to a small proxy on the unix socket that reads
+SO_PEERCRED and forwards to the gRPC server over loopback TCP, so each RPC
+can be attributed to the uid that made it.
 
-The state directory holds:
-  log    one line per command: time, caller uid, command
-  fail   if present, "up" fails like a logged-out client
-  slow   if present, its number is how many seconds the interface takes to
-         appear after "up" returns (like a slow first connection)
+Behaviour can be changed through files in the state directory:
+  log    one line per RPC: time, caller uid, method, username
+  fail   if present, Login says an interactive (SSO) login is needed
+  slow   seconds the interface takes to appear after Up returns
+  owner  username that owns the active profile (default: none)
+
+Also importable (tests/unit/test_daemon.py) with fake interface functions.
 """
 
-import json
+from __future__ import annotations
+
 import os
 import socket
 import struct
@@ -22,80 +26,168 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent import futures
 from pathlib import Path
 
-SOCK = os.environ.get("FAKE_NETBIRD_SOCK", "/run/fake-netbird.sock")
-STATE = Path(os.environ.get("FAKE_NETBIRD_STATE", "/tmp/fake-netbird"))
-IFACE = os.environ.get("FAKE_NETBIRD_IFACE", "wt0")
-pending: list = []          # a delayed interface creation, cancelled by "down"
+HERE = Path(__file__).resolve().parent
+for candidate in (HERE, HERE.parents[1] / "src"):      # installed copy / repo checkout
+    if (candidate / "netbird_nm").is_dir():
+        sys.path.insert(0, str(candidate))
+        break
+
+from netbird_nm.daemon import decode, encode  # noqa: E402
+
+MGMT_URL = os.environ.get("FAKE_NETBIRD_MGMT", "https://198.51.100.10:443")
+ADDRESS = "100.92.1.5/16"
 
 
-def sh(*cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
+class Interface:
+    """The real TUN interface (integration tests)."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def exists(self) -> bool:
+        return Path("/sys/class/net", self.name).exists()
+
+    def create(self) -> None:
+        def sh(*cmd):
+            subprocess.run(cmd, capture_output=True)
+        if not self.exists():
+            sh("ip", "tuntap", "add", "dev", self.name, "mode", "tun")
+        sh("ip", "addr", "replace", ADDRESS, "dev", self.name)
+        sh("ip", "link", "set", self.name, "up")
+
+    def remove(self) -> None:
+        subprocess.run(["ip", "link", "del", self.name], capture_output=True)
 
 
-def exists():
-    return Path("/sys/class/net", IFACE).exists()
+class FakeNetBird:
+    def __init__(self, state: Path, iface, delay: float = 1.0):
+        self.state = Path(state)
+        self.iface = iface
+        self.delay = delay              # how long Up/Down take, like the real thing
+        self.pending: list[threading.Timer] = []
+        self.peers: dict[int, int] = {}  # loopback source port -> caller uid
+
+    def _flag(self, name: str) -> str | None:
+        try:
+            return (self.state / name).read_text().strip()
+        except FileNotFoundError:
+            return None
+
+    def _log(self, uid, method: str, username: str = "") -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        with open(self.state / "log", "a") as f:
+            f.write(f"{time.strftime('%T')} uid={uid} {method} username={username}\n")
+
+    def connected(self) -> bool:
+        return self.iface.exists()
+
+    # -- RPCs: bytes in, bytes out ----------------------------------------------------
+    def Status(self, req: bytes) -> bytes:
+        up = self.connected()
+        mgmt = encode([(1, MGMT_URL), (2, up)])
+        local = encode([(1, ADDRESS if up else ""), (4, "test.netbird.cloud" if up else "")])
+        return encode([(1, "Connected" if up else "Idle"), (2, encode([(1, mgmt), (3, local)])),
+                       (3, "0.0.0-fake")])
+
+    def GetActiveProfile(self, req: bytes) -> bytes:
+        return encode([(1, "default"), (2, self._flag("owner") or ""), (3, "default")])
+
+    def Login(self, req: bytes) -> bytes:
+        return encode([(1, self._flag("fail") is not None)])
+
+    def Up(self, req: bytes) -> bytes:
+        if self._flag("fail") is not None:
+            raise PermissionError("not logged in")
+        if not self.connected():
+            time.sleep(self.delay)
+            slow = float(self._flag("slow") or 0)
+            if slow:
+                t = threading.Timer(slow, self.iface.create)
+                self.pending.append(t)
+                t.start()
+            else:
+                self.iface.create()
+        return b""
+
+    def Down(self, req: bytes) -> bytes:
+        while self.pending:
+            self.pending.pop().cancel()
+        time.sleep(self.delay)
+        self.iface.remove()
+        return b""
+
+    def GetConfig(self, req: bytes) -> bytes:
+        return encode([(1, MGMT_URL), (6, self.iface.name)])
+
+    # -- gRPC plumbing -----------------------------------------------------------------
+    def handler(self):
+        import grpc
+
+        def wrap(name):
+            fn = getattr(self, name)
+
+            def call(req, context):
+                peer = context.peer()               # "ipv4:127.0.0.1:PORT"
+                uid = self.peers.get(int(peer.rsplit(":", 1)[1])) if peer.startswith("ipv4:") else None
+                fields = decode(req)
+                user = {"Up": 2, "Login": 31, "GetConfig": 2}.get(name)
+                username = fields[user][-1].decode() if user and user in fields else ""
+                self._log(uid, name, username)
+                try:
+                    return fn(req)
+                except PermissionError as e:
+                    context.abort(grpc.StatusCode.PERMISSION_DENIED, str(e))
+            return grpc.unary_unary_rpc_method_handler(
+                call, request_deserializer=lambda b: b, response_serializer=lambda b: b)
+
+        methods = ("Status", "GetActiveProfile", "Login", "Up", "Down", "GetConfig")
+        return grpc.method_handlers_generic_handler("daemon.DaemonService",
+                                                    {m: wrap(m) for m in methods})
+
+    def serve(self, sock_path: str) -> None:
+        """Serve on unix socket ``sock_path`` (blocking)."""
+        import grpc
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+        server.add_generic_rpc_handlers((self.handler(),))
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+        lst = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        lst.bind(sock_path)
+        os.chmod(sock_path, 0o666)      # like NetBird: ordinary users may connect
+        lst.listen(16)
+        while True:
+            client, _ = lst.accept()
+            creds = client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            uid = struct.unpack("3i", creds)[1]
+            upstream = socket.create_connection(("127.0.0.1", port))
+            self.peers[upstream.getsockname()[1]] = uid
+            for a, b in ((client, upstream), (upstream, client)):
+                threading.Thread(target=_pipe, args=(a, b), daemon=True).start()
 
 
-def create_iface():
-    if not exists():
-        sh("ip", "tuntap", "add", "dev", IFACE, "mode", "tun")
-    sh("ip", "addr", "replace", "100.92.1.5/16", "dev", IFACE)
-    sh("ip", "link", "set", IFACE, "up")
+def _pipe(src: socket.socket, dst: socket.socket) -> None:
+    try:
+        while data := src.recv(65536):
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for s in (src, dst):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
 
-def handle(cmd):
-    if cmd == "up":
-        if (STATE / "fail").exists():
-            return 1, "", "Error: not logged in, run netbird login\n"
-        if exists():
-            return 0, "Already connected\n", ""
-        time.sleep(1)
-        delay = float((STATE / "slow").read_text() or 0) if (STATE / "slow").exists() else 0
-        if delay:
-            t = threading.Timer(delay, create_iface)
-            pending.append(t)
-            t.start()
-        else:
-            create_iface()
-        return 0, "Connected\n", ""
-    if cmd == "down":
-        while pending:
-            pending.pop().cancel()
-        time.sleep(1)
-        sh("ip", "link", "del", IFACE)
-        return 0, "Disconnected\n", ""
-    if cmd == "status":
-        state = "Connected" if exists() else "Disconnected"
-        return 0, f"Management: {state}\nSignal: {state}\n", ""
-    return 2, "", f"unsupported command {cmd}\n"
-
-
-def serve(conn):
-    with conn:
-        creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-        _pid, uid, _gid = struct.unpack("3i", creds)
-        cmd = conn.recv(1024).decode().strip()
-        STATE.mkdir(parents=True, exist_ok=True)
-        with open(STATE / "log", "a") as f:
-            f.write(f"{time.strftime('%T')} uid={uid} {cmd}\n")
-        rc, out, err = handle(cmd)
-        conn.sendall(json.dumps({"rc": rc, "out": out, "err": err}).encode())
-
-
-def main():
-    STATE.mkdir(parents=True, exist_ok=True)
-    if os.path.exists(SOCK):
-        os.unlink(SOCK)
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(SOCK)
-    os.chmod(SOCK, 0o666)        # like NetBird: ordinary users may control it
-    srv.listen(8)
-    print(f"fake netbird daemon on {SOCK}", file=sys.stderr, flush=True)
-    while True:
-        conn, _ = srv.accept()
-        threading.Thread(target=serve, args=(conn,), daemon=True).start()
+def main() -> None:
+    sock = os.environ.get("FAKE_NETBIRD_SOCK", "/run/fake-netbird.sock")
+    state = Path(os.environ.get("FAKE_NETBIRD_STATE", "/tmp/fake-netbird"))
+    FakeNetBird(state, Interface(os.environ.get("FAKE_NETBIRD_IFACE", "wt0"))).serve(sock)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,8 @@ SANDBOX = ["sh", str(HERE / "sandbox.sh")]
 # The fakes get copied somewhere every user can execute them.
 FAKE_DIR = Path("/usr/local/lib/netbird-nm-test")
 FAKE_NETBIRD = str(FAKE_DIR / "fake-netbird")
+FAKE_SOCK = "/run/fake-netbird.sock"
+MGMT_IP = "198.51.100.10"        # the fake daemon's management server (TEST-NET-2)
 FAKE_STATE = Path("/tmp/fake-netbird")
 TEST_USER = "nbtest"          # ordinary users who "log in" to the desktop in these tests
 TEST_USER2 = "nbtest2"
@@ -84,7 +86,8 @@ os.environ.setdefault("NETBIRD_NM_RESTART_CMD", " ".join(SANDBOX + ["restart-nm"
 
 
 def install(*extra: str) -> subprocess.CompletedProcess[str]:
-    r = sh(*CLI, "install", "--netbird", FAKE_NETBIRD, "-y", *extra)
+    r = sh(*CLI, "install", "--netbird", FAKE_NETBIRD, "--daemon-addr", "unix://" + FAKE_SOCK,
+           "-y", *extra)
     assert r.returncode == 0, r.stdout + r.stderr
     return r
 
@@ -118,8 +121,9 @@ def uid_of(user: str) -> int:
 
 
 def callers(cmd: str) -> list[int]:
-    """uids that sent ``cmd`` to the fake daemon, in order."""
-    return [int(ln.split("uid=")[1].split()[0]) for ln in daemon_log() if ln.endswith(" " + cmd)]
+    """uids that made RPC ``cmd`` ("up" → Up) to the fake daemon, in order."""
+    method = " " + cmd.capitalize() + " "
+    return [int(ln.split("uid=")[1].split()[0]) for ln in daemon_log() if method in ln + " "]
 
 
 def daemon_log() -> list[str]:
@@ -154,6 +158,12 @@ def sandbox():
     for name in ("fake-netbird", "fake-netbirdd"):
         shutil.copy(HERE / name, FAKE_DIR / name)
         (FAKE_DIR / name).chmod(0o755)
+    # the fakes speak gRPC with the package's own codec; give them a copy any user can read
+    shutil.rmtree(FAKE_DIR / "netbird_nm", ignore_errors=True)
+    shutil.copytree(REPO / "src" / "netbird_nm", FAKE_DIR / "netbird_nm",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    sh("chmod", "-R", "a+rX", str(FAKE_DIR))
+    sh("pkill", "-f", "[f]ake-netbirdd")
     daemon = subprocess.Popen([sys.executable, str(FAKE_DIR / "fake-netbirdd")],
                               stderr=subprocess.DEVNULL, start_new_session=True)
     assert wait_for(lambda: Path("/run/fake-netbird.sock").exists(), 10)
@@ -466,7 +476,7 @@ def test_failure_explains_itself_in_the_log(installed):
         f.seek(start)
         new = f.read()
     assert "netbird up said: Connected" in new
-    assert "netbird status: Management: Disconnected" in new
+    assert 'netbird status: {"status": "Idle"' in new         # what the daemon reported
     assert "IPv4 addresses:" in new
     settle("inactive", "down")
 
@@ -496,3 +506,64 @@ def test_network_change_keeps_address_after_resume(installed):
     base("up")
     settle("activated", "up", timeout=40)
     assert has_ipv4()
+
+
+# -- 0.4.0 -----------------------------------------------------------------------------------
+
+def test_default_backend_is_grpc(installed):
+    assert json.loads(CONFIG.read_text())["backend"] == "grpc"
+    nm_up()
+    settle("activated", "up")
+    methods = [ln.split()[2] for ln in daemon_log()]
+    i = methods.index("Up")       # (install's own check made a few Status calls before)
+    assert methods[i - 3:i + 1] == ["Status", "GetActiveProfile", "Login", "Up"], methods
+
+
+def test_nm_leaves_netbird_address_alone(installed):
+    """NM is told there's no IP config to manage, so taking the VPN down no longer
+    strips NetBird's address (the bug 0.2.1 had to work around)."""
+    nm_up()
+    settle("activated", "up")
+    touch_keep = Path("/run/nm-netbird/keep-running")
+    touch_keep.touch()                       # make the disconnect leave NetBird running
+    try:
+        nm_down()
+        settle("inactive", "up")
+        time.sleep(3)
+        assert has_ipv4()
+    finally:
+        touch_keep.unlink(missing_ok=True)
+    assert nm_up().returncode == 0
+    settle("activated", "up")
+    assert callers("down") == [], "no restart was needed"
+
+
+def test_gateway_route_points_at_management_server(installed):
+    nm_up()
+    settle("activated", "up")
+    routes = sh("ip", "-4", "route").stdout
+    assert f"{MGMT_IP} via 10.99.0.254 dev nmsbx-base" in routes, routes
+    assert "100.92.1.5 via" not in routes            # 0.3 routed our own tunnel address
+
+
+def test_cli_backend(installed):
+    install("--backend", "cli")
+    assert json.loads(CONFIG.read_text())["backend"] == "cli"
+    assert nm_up().returncode == 0
+    settle("activated", "up")
+    nm_down()
+    settle("inactive", "down")
+    assert callers("up") == [uid_of(TEST_USER)] and callers("down") == [uid_of(TEST_USER)]
+    routes = sh("ip", "-4", "route").stdout
+    assert "100.92.1.5 via" not in routes
+
+
+def test_custom_vpn_dir(installed):
+    install("--vpn-dir", "/etc/NetworkManager/VPN", "--no-restart-nm")
+    assert Path("/etc/NetworkManager/VPN/nm-netbird-service.name").exists()
+    assert not Path("/usr/lib/NetworkManager/VPN/nm-netbird-service.name").exists()
+    out = sh(*CLI, "status").stdout
+    assert "/etc/NetworkManager/VPN/nm-netbird-service.name" in out
+    install("--vpn-dir", "/usr/lib/NetworkManager/VPN")
+    assert not Path("/etc/NetworkManager/VPN/nm-netbird-service.name").exists()
+    assert nm_up().returncode == 0

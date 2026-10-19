@@ -1,36 +1,53 @@
 #!/usr/bin/env python3
-"""Stand-in for the netbird CLI: forwards its command to fake-netbirdd over a
-unix socket and prints the answer, so it works as any user, like the real CLI."""
+"""Stand-in for the netbird CLI (backend "cli" tests): talks to fake-netbirdd
+over gRPC like the real CLI talks to the real daemon, so it works as any user.
+Supports up, down, status and status --json (the CLI's JSON shape)."""
 
+import io
 import json
 import os
-import socket
 import sys
+from contextlib import redirect_stdout
+from pathlib import Path
 
-SOCK = os.environ.get("FAKE_NETBIRD_SOCK", "/run/fake-netbird.sock")
+HERE = Path(__file__).resolve().parent
+for candidate in (HERE, HERE.parents[1] / "src"):
+    if (candidate / "netbird_nm").is_dir():
+        sys.path.insert(0, str(candidate))
+        break
+
+from netbird_nm.daemon import main as daemon_main  # noqa: E402
+
+ADDR = "unix://" + os.environ.get("FAKE_NETBIRD_SOCK", "/run/fake-netbird.sock")
 
 
-def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "version":
+def main() -> int:
+    args = sys.argv[1:]
+    if args == ["version"]:
         print("0.0.0-fake")
         return 0
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(SOCK)
-    except OSError as e:
-        print(f"failed to connect to daemon error: {e}", file=sys.stderr)
-        return 1
-    with s:
-        s.sendall(cmd.encode())
-        s.shutdown(socket.SHUT_WR)
-        data = b""
-        while chunk := s.recv(65536):
-            data += chunk
-    reply = json.loads(data)
-    sys.stdout.write(reply["out"])
-    sys.stderr.write(reply["err"])
-    return reply["rc"]
+    if args == ["status", "--json"]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = daemon_main(["--addr", ADDR, "status"])
+        if rc:
+            return rc
+        st = json.loads(buf.getvalue())
+        print(json.dumps({"daemonStatus": st["status"], "netbirdIp": st["ip"], "fqdn": st["fqdn"],
+                          "management": {"url": st["management_url"],
+                                         "connected": st["management_connected"]}}))
+        return 0
+    if args == ["status"]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = daemon_main(["--addr", ADDR, "status"])
+        if rc:
+            return rc
+        st = json.loads(buf.getvalue())
+        state = "Connected" if st["management_connected"] else "Disconnected"
+        print(f"Daemon status: {st['status']}\nManagement: {state}\nNetBird IP: {st['ip'] or 'N/A'}")
+        return 0
+    return daemon_main(["--addr", ADDR, *args])
 
 
 if __name__ == "__main__":

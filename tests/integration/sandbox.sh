@@ -38,10 +38,10 @@ start_nm() {
                 mount --bind "$d" "$d" && mount -o remount,bind,ro "$d"
             done
             exec setpriv --bounding-set -all,+net_admin,+dac_override,+net_raw,+net_bind_service,+setgid,+setuid,+sys_module,+audit_write,+kill,+sys_chroot \
-                NetworkManager --no-daemon --log-level=DEBUG \
+                NetworkManager --no-daemon --debug --log-level=DEBUG \
                 --log-domains=VPN,VPN_PLUGIN,CORE,DEVICE,DISPATCH' >> "$LOG" 2>&1 < /dev/null &
     else
-        setsid NetworkManager --no-daemon --log-level=DEBUG \
+        setsid NetworkManager --no-daemon --debug --log-level=DEBUG \
             --log-domains=VPN,VPN_PLUGIN,CORE,DEVICE,DISPATCH >> "$LOG" 2>&1 < /dev/null &
     fi
     i=0
@@ -73,7 +73,7 @@ case "${1:-}" in
     deps)
         apt-get update -qq
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq network-manager dbus iproute2 \
-            python3-gi gir1.2-nm-1.0 python3-pytest >/dev/null ;;
+            python3-gi gir1.2-nm-1.0 python3-grpcio python3-pytest >/dev/null ;;
     start)
         [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
         mkdir -p /etc/NetworkManager/conf.d
