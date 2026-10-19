@@ -25,7 +25,9 @@ SANDBOX = ["sh", str(HERE / "sandbox.sh")]
 FAKE_DIR = Path("/usr/local/lib/netbird-nm-test")
 FAKE_NETBIRD = str(FAKE_DIR / "fake-netbird")
 FAKE_STATE = Path("/tmp/fake-netbird")
-TEST_USER = "nbtest"          # an ordinary user; the plugin runs netbird as this user
+TEST_USER = "nbtest"          # ordinary users who "log in" to the desktop in these tests
+TEST_USER2 = "nbtest2"
+SEAT0 = Path("/run/systemd/seats/seat0")   # what systemd-logind writes; emulated here
 CONFIG = Path("/etc/netbird-nm.json")
 SERVICE = "org.freedesktop.NetworkManager.netbird"
 
@@ -82,8 +84,7 @@ os.environ.setdefault("NETBIRD_NM_RESTART_CMD", " ".join(SANDBOX + ["restart-nm"
 
 
 def install(*extra: str) -> subprocess.CompletedProcess[str]:
-    who = [] if {"--user", "--as-root"} & set(extra) else ["--user", TEST_USER]
-    r = sh(*CLI, "install", "--netbird", FAKE_NETBIRD, "-y", *who, *extra)
+    r = sh(*CLI, "install", "--netbird", FAKE_NETBIRD, "-y", *extra)
     assert r.returncode == 0, r.stdout + r.stderr
     return r
 
@@ -100,6 +101,25 @@ def base(action: str) -> None:
 
 def fake_netbird(cmd: str) -> None:
     sh(FAKE_NETBIRD, cmd, check=True)
+
+
+def logged_in(user: str | None) -> None:
+    """Pretend ``user`` has the active desktop session (None: nobody logged in)."""
+    if user is None:
+        SEAT0.unlink(missing_ok=True)
+        return
+    SEAT0.parent.mkdir(parents=True, exist_ok=True)
+    SEAT0.write_text(f"IS_SEAT0=1\nACTIVE=c1\nACTIVE_UID={uid_of(user)}\n")
+
+
+def uid_of(user: str) -> int:
+    import pwd
+    return pwd.getpwnam(user).pw_uid
+
+
+def callers(cmd: str) -> list[int]:
+    """uids that sent ``cmd`` to the fake daemon, in order."""
+    return [int(ln.split("uid=")[1].split()[0]) for ln in daemon_log() if ln.endswith(" " + cmd)]
 
 
 def daemon_log() -> list[str]:
@@ -127,8 +147,9 @@ def speed_up_timers() -> None:
 @pytest.fixture(scope="module", autouse=True)
 def sandbox():
     sh(*SANDBOX, "start", check=True)
-    if sh("id", TEST_USER).returncode != 0:
-        sh("useradd", "--create-home", TEST_USER, check=True)
+    for user in (TEST_USER, TEST_USER2):
+        if sh("id", user).returncode != 0:
+            sh("useradd", "--create-home", user, check=True)
     FAKE_DIR.mkdir(parents=True, exist_ok=True)
     for name in ("fake-netbird", "fake-netbirdd"):
         shutil.copy(HERE / name, FAKE_DIR / name)
@@ -139,6 +160,7 @@ def sandbox():
     yield
     sh(*CLI, "uninstall")
     sh("ip", "link", "del", "wt0")
+    logged_in(None)
     daemon.terminate()
 
 
@@ -147,6 +169,7 @@ def installed():
     reset_fake_state()
     sh("ip", "link", "del", "wt0")
     base("up")
+    logged_in(TEST_USER)
     install()
     speed_up_timers()
     yield
@@ -368,28 +391,60 @@ def test_upgrade_from_shell_version(installed):
 
 # -- 0.2.1 -----------------------------------------------------------------------------
 
-def uid_of(user: str) -> int:
-    import pwd
-    return pwd.getpwnam(user).pw_uid
+def test_install_does_not_pin_a_user(installed):
+    assert json.loads(CONFIG.read_text())["run_as"] == "session"
 
 
-def test_netbird_runs_as_the_configured_user(installed):
-    """Connect and disconnect both reach the daemon as the ordinary user, not root."""
+def test_netbird_runs_as_the_logged_in_user(installed):
+    """Connect and disconnect both reach the daemon as the desktop user, not root."""
     assert nm_up().returncode == 0
     settle("activated", "up")
     nm_down()
     settle("inactive", "down")
-    calls = [ln for ln in daemon_log() if ln.endswith((" up", " down"))]
-    assert calls and all(f"uid={uid_of(TEST_USER)} " in ln for ln in calls), calls
+    assert callers("up") == [uid_of(TEST_USER)]
+    assert callers("down") == [uid_of(TEST_USER)]
 
 
-def test_as_root_option(installed):
-    install("--as-root")
-    assert json.loads(CONFIG.read_text())["user"] == ""
-    reset_fake_state()
+def test_user_follows_whoever_is_logged_in(installed):
+    nm_up()
+    settle("activated", "up")
+    nm_down()
+    settle("inactive", "down")
+    logged_in(TEST_USER2)                      # another person logs in
     assert nm_up().returncode == 0
     settle("activated", "up")
-    assert any(ln.endswith("uid=0 up") for ln in daemon_log()), daemon_log()
+    assert callers("up") == [uid_of(TEST_USER), uid_of(TEST_USER2)]
+
+
+def test_down_uses_the_user_who_connected(installed):
+    nm_up()
+    settle("activated", "up")
+    logged_in(TEST_USER2)                      # user switch while connected
+    nm_down()
+    settle("inactive", "down")
+    assert callers("down") == [uid_of(TEST_USER)]
+
+
+def test_nobody_logged_in_runs_as_root(installed):
+    logged_in(None)
+    assert nm_up().returncode == 0
+    settle("activated", "up")
+    assert callers("up") == [0]
+
+
+def test_fixed_user_and_root_options(installed):
+    install("--user", TEST_USER2)
+    assert json.loads(CONFIG.read_text())["run_as"] == TEST_USER2
+    nm_up()
+    settle("activated", "up")
+    nm_down()
+    settle("inactive", "down")
+    install("--as-root")
+    nm_up()
+    settle("activated", "up")
+    install("--session-user")
+    assert json.loads(CONFIG.read_text())["run_as"] == "session"
+    assert callers("up")[-2:] == [uid_of(TEST_USER2), 0]
 
 
 def test_slow_first_connection_still_succeeds(installed):
@@ -418,7 +473,7 @@ def test_failure_explains_itself_in_the_log(installed):
 
 def test_doctor_checks_the_user(installed):
     out = sh(*CLI, "doctor").stdout
-    assert f"netbird runs as {TEST_USER} and reaches the NetBird daemon" in out
+    assert f"now: {TEST_USER}" in out and f"{TEST_USER} can reach the NetBird daemon" in out
 
 
 def test_connects_when_netbird_was_left_without_its_address(installed):

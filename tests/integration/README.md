@@ -7,8 +7,9 @@ two fakes with the same split as the real thing:
 and removes a TUN interface `wt0` with a 100.x address, and
 [`fake-netbird`](fake-netbird), a CLI that only sends it commands, so it can
 run as an ordinary user. The daemon logs each caller's uid, which is how the
-tests prove `netbird` runs as the configured user (`nbtest`, created by the
-tests). The daemon can also be told to fail `up`, or to bring the interface up
+tests prove `netbird` runs as the logged-in user. Logins are emulated by
+writing `/run/systemd/seats/seat0` the way systemd-logind does, switching
+between two users (`nbtest`, `nbtest2`) the tests create. The daemon can also be told to fail `up`, or to bring the interface up
 late, through files in `/tmp/fake-netbird`.
 
 They start, stop and reconfigure NetworkManager, so **only run them in a
@@ -39,10 +40,12 @@ What's covered:
 - the exact `nmcli` calls the Quickshell bar makes, including `nmcli monitor`
 - `status`, `doctor --live`, uninstall, and upgrading from the shell script
   in [`legacy/`](legacy/)
-- `netbird` running as the configured user, and as root with `--as-root`
+- `netbird` running as the logged-in user, following a different user logging
+  in, disconnecting as the user who connected, root when nobody is logged in,
+  and `--user` / `--as-root` / `--session-user`
 - a slow first connection (address after 30s), and a failure that explains
   itself in the log
 - NetBird left running without its address (NetworkManager removes it when
   the VPN goes down) being repaired on connect and after network changes
 
-The suite takes about six minutes.
+The suite takes about eight minutes.
