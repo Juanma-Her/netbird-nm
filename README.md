@@ -45,9 +45,20 @@ Options:
 | `--name NAME` | connection name (default `NetBird`) |
 | `--iface IFACE` | NetBird's interface (default: read from `/etc/netbird/config.json`, else `wt0`) |
 | `--netbird PATH` | the netbird binary (default: from `PATH`) |
+| `--user NAME` | run the `netbird` command as this user (default: you, when installing through sudo) |
+| `--as-root` | run the `netbird` command as root instead |
 | `--restart-nm` / `--no-restart-nm` | restart NetworkManager if it's needed, without asking / never |
 | `--no-deps` | don't install missing Python bindings |
 | `-y` | answer yes to questions |
+
+### Which user runs `netbird`
+
+NetworkManager starts every VPN plugin as root, but the plugin doesn't run
+the `netbird` command as root: it switches to your user first (or whichever
+`--user` you gave). That command only asks NetBird's own daemon, a separate
+root service, to connect or disconnect, so it needs no privileges, and this
+way it acts on exactly the same NetBird profile as `netbird` in your terminal.
+`install` and `doctor` check that this user can reach the daemon.
 
 ## Use
 
@@ -98,7 +109,11 @@ journalctl -t nm-netbird -f  # plugin and dispatcher logs
   must be enabled. The installer does this; check with
   `systemctl is-enabled NetworkManager-dispatcher.service`.
 - **Connecting times out**: NetBird probably isn't logged in. Run `netbird up`
-  once in a terminal.
+  once in a terminal. The log shows what `netbird up` and `netbird status`
+  printed.
+- **"'netbird status' failed as <user>"** during install: that user can't
+  control NetBird's daemon. Reinstall with `--user` someone who can, or
+  `--as-root`.
 
 ## How it works
 
@@ -113,6 +128,11 @@ journalctl -t nm-netbird -f  # plugin and dispatcher logs
 
 The plugin reports NetBird's IPv4 address to NetworkManager with
 `never-default`, and no DNS, so NetBird keeps managing its own routes and DNS.
+
+One quirk of that: when the VPN goes down, NetworkManager removes the address
+it "configured" from NetBird's interface. Whenever NetBird is meant to keep
+running across that (network switches, uninstall), netbird-nm restarts it so
+the address comes back.
 
 The connection logic (`controller.py`, `dispatcher.py`, `state.py`) has no
 GObject dependency and is unit-tested on its own; `service.py` is the thin

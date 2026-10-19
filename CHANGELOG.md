@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.1
+
+- **Fixed**: connecting failed with "interface wt0 never got an IPv4 address"
+  when NetBird was already running. Taking the VPN down makes NetworkManager
+  remove NetBird's address from its interface; if NetBird stayed up (network
+  switch, uninstall, an earlier version), the next `netbird up` only said
+  "Already connected" and the address never came back. The plugin now
+  notices this and restarts NetBird, and uninstall restores the address when
+  it leaves NetBird running.
+- The `netbird` command now runs as your user instead of root (`--user NAME`,
+  default: whoever ran `install` through sudo; `--as-root` keeps the old
+  behavior). It only talks to NetBird's own daemon, so it doesn't need root,
+  and it now behaves exactly like `netbird` in your terminal. Install and
+  `doctor` check that this user can reach the daemon.
+- Connecting waits for NetBird's address for the whole time NetworkManager
+  allows (about 55 seconds) instead of 20.
+- Failures explain themselves in `journalctl -t nm-netbird`: what `netbird up`
+  printed and, when the interface doesn't come up, `netbird status` and the
+  system's IPv4 addresses.
+
 ## 0.2.0
 
 Rewritten in Python as a proper project.
