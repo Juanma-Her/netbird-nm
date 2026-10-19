@@ -64,6 +64,7 @@ def test_install_asks_before_restarting_nm(tmp_path, monkeypatch):
             seen["restart"] = opts.restart_nm
             raise RuntimeError("stop here")
 
+    monkeypatch.setattr(cli, "has_grpc", lambda py: True)
     monkeypatch.setattr(cli, "find_python", lambda: sys.executable)
     monkeypatch.setattr(cli, "ask", lambda q, default: seen.setdefault("asked", q) and False)
     inst = Inst(Layout(root=tmp_path), StubNM())
@@ -84,6 +85,7 @@ def test_install_does_not_ask_when_dir_is_watched(tmp_path, monkeypatch):
             seen["restart"] = opts.restart_nm
             raise RuntimeError("stop here")
 
+    monkeypatch.setattr(cli, "has_grpc", lambda py: True)
     monkeypatch.setattr(cli, "find_python", lambda: sys.executable)
     monkeypatch.setattr(cli, "ask", lambda *a: pytest.fail("should not ask"))
     cli.cmd_install(cli.build_parser().parse_args(["install"]), Inst(Layout(root=tmp_path), StubNM()))
