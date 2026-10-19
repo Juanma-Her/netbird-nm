@@ -18,6 +18,7 @@ from pathlib import Path
 from . import __version__
 from .config import Config
 from .const import SERVICE
+from .controller import resolve_user
 from .installer import (
     Installer,
     InstallOptions,
@@ -47,6 +48,13 @@ def warn(msg: str) -> None:
 
 def err(msg: str) -> None:
     print(f"{_c('1;31', 'error:')} {msg}", file=sys.stderr)
+
+
+def describe_run_as(run_as: str, now: str) -> str:
+    if run_as == "session":
+        return ("whoever is logged in on the desktop, at each connect "
+                f"(now: {now or 'nobody, so root'})")
+    return run_as
 
 
 def ensure_root(argv: list[str]) -> None:
@@ -102,17 +110,17 @@ def cmd_install(args: argparse.Namespace, inst: Installer) -> int:
 
     try:
         res = inst.install(InstallOptions(name=args.name, iface=args.iface,
-                                          netbird=args.netbird, python=python, user=args.user,
+                                          netbird=args.netbird, python=python, run_as=args.run_as,
                                           restart_nm=bool(restart)))
     except RuntimeError as e:
         err(str(e))
         return 1
 
     say(f"netbird: {res['netbird']}   interface: {res['iface']}   python: {res['python']}")
-    say(f"'netbird up/down' will run as: {res['user'] or 'root'}")
+    say("'netbird up/down' will run as: " + describe_run_as(res["run_as"], res["user_now"]))
     if res.get("user_check"):
-        warn(f"'netbird status' failed as {res['user']}: {res['user_check']}. If your user can't "
-             "control NetBird, reinstall with --as-root.")
+        warn(f"'netbird status' failed as {res['user_now']}: {res['user_check']}. If that user "
+             "can't control NetBird, reinstall with --as-root.")
     for item in res["legacy"]:
         say(f"Removed leftover from an earlier version: {item}")
     say(f"Plugin registered in {res['vpn_dir']}")
@@ -187,15 +195,15 @@ def cmd_doctor(args: argparse.Namespace, inst: Installer) -> int:
     check(nm.running(), "NetworkManager is running", "NetworkManager isn't running")
     check(os.access(cfg.netbird, os.X_OK), f"netbird found at {cfg.netbird}",
           f"netbird not found at {cfg.netbird} (reinstall with --netbird PATH)")
-    if cfg.user:
+    now = resolve_user(cfg)
+    print("  ..  netbird runs as: " + describe_run_as(cfg.run_as, now))
+    if now:
         try:
-            problem = inst.check_user_can_reach_netbird(cfg.netbird, RunAs.lookup(cfg.user))
+            problem = inst.check_user_can_reach_netbird(cfg.netbird, RunAs.lookup(now))
         except KeyError:
             problem = "that user doesn't exist"
-        check(not problem, f"netbird runs as {cfg.user} and reaches the NetBird daemon",
-              f"'netbird status' as {cfg.user} failed: {problem} (reinstall with --user or --as-root)")
-    else:
-        print("  ..  netbird runs as root (reinstall with --user NAME to run it as your user)")
+        check(not problem, f"{now} can reach the NetBird daemon",
+              f"'netbird status' as {now} failed: {problem} (reinstall with --as-root?)")
     plugin = L.p(L.plugin_bin)
     check(plugin.exists(), f"plugin installed at {plugin}", "plugin missing; run install")
     if plugin.exists():
@@ -249,10 +257,13 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--netbird", help="path to the netbird binary (default: from PATH)")
     i.add_argument("--python", help="Python interpreter for the plugin (default: auto-detect)")
     who = i.add_mutually_exclusive_group()
-    who.add_argument("--user", help="run the netbird command as this user "
-                                    "(default: you, when installing through sudo)")
-    who.add_argument("--as-root", dest="user", action="store_const", const="",
-                     help="run the netbird command as root")
+    who.add_argument("--user", dest="run_as", metavar="NAME",
+                     help="always run the netbird command as this user (default: whoever is "
+                          "logged in on the desktop, decided at each connect)")
+    who.add_argument("--as-root", dest="run_as", action="store_const", const="root",
+                     help="always run the netbird command as root")
+    who.add_argument("--session-user", dest="run_as", action="store_const", const="session",
+                     help="go back to the default after --user or --as-root")
     i.add_argument("--no-deps", action="store_true", help="don't install missing Python bindings")
     g = i.add_mutually_exclusive_group()
     g.add_argument("--restart-nm", dest="restart_nm", action="store_true", default=None,

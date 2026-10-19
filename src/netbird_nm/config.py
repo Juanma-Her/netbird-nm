@@ -13,7 +13,10 @@ from .const import CONFIG_PATH, DEFAULT_IFACE, MARKER, STATE_DIR
 @dataclass
 class Config:
     netbird: str = "/usr/bin/netbird"   # absolute path; NM runs us with a minimal PATH
-    user: str = ""                      # run the netbird CLI as this user ("" = root)
+    # Who runs the netbird CLI: "session" = the user of the active desktop
+    # session at each connect (root if nobody is logged in), "root", or a
+    # fixed user name. (0.2.1's "user" key is ignored, so it upgrades to "session".)
+    run_as: str = "session"
     iface: str = DEFAULT_IFACE          # NetBird's WireGuard interface
     state_dir: str = STATE_DIR
     connect_timeout: float = 55.0       # 'netbird up' + the address showing up; NM gives up at 60s

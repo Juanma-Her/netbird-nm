@@ -1,3 +1,4 @@
+import pwd
 import socket
 import struct
 import subprocess
@@ -8,6 +9,9 @@ from netbird_nm.config import Config
 from netbird_nm.controller import ConnectError, Controller, TunnelInfo, Watchdog, ip_to_u32, vpn_config
 from netbird_nm.netbird import NetBird
 from netbird_nm.state import StateDir
+
+NOBODY_UID = pwd.getpwnam("nobody").pw_uid
+DAEMON_UID = pwd.getpwnam("daemon").pw_uid
 
 
 def make(tmp_path, runner, sleep, ipv4=("100.92.1.5", 16), **cfg):
@@ -198,12 +202,11 @@ def test_logs_who_runs_netbird(tmp_path, runner, clock):
     assert "running netbird up (as root)" in logs
 
 
-def test_unknown_user_fails_clearly(tmp_path, clock):
-    cfg = Config(netbird="/bin/netbird", user="no-such-user-xyz", state_dir=str(tmp_path))
+def test_unknown_fixed_user_fails_clearly(tmp_path, clock):
+    cfg = Config(netbird="/bin/netbird", run_as="no-such-user-xyz", state_dir=str(tmp_path))
     ctl = Controller(cfg, log=lambda m: None, sleep=clock)
     with pytest.raises(ConnectError, match="no-such-user-xyz.*doesn't exist"):
         ctl.bring_up()
-    assert ctl.netbird.run_as is None       # 'down' can still run, as root
 
 
 def test_restarts_netbird_left_without_its_address(tmp_path, runner, clock):
@@ -243,3 +246,60 @@ def test_restart_failure_is_reported(tmp_path, runner, clock):
     ctl, _ = make(tmp_path, runner, clock, ipv4=lambda iface: None)
     with pytest.raises(ConnectError, match="after restarting NetBird: Error: logged out"):
         ctl.bring_up()
+
+
+# -- user chosen at each connect -----------------------------------------------------------
+
+def per_connect(tmp_path, runner, run_as="session", session=lambda: "nobody", seen=None):
+    seen = [] if seen is None else seen
+
+    def record(cmd, **kw):
+        seen.append((cmd[1], kw.get("user")))
+        return ("Connected\n" if cmd[1] == "up" else "", 0, "")
+    runner.on(["/bin/netbird"], action=record)
+    cfg = Config(netbird="/bin/netbird", run_as=run_as, state_dir=str(tmp_path / "run"), down_grace=0)
+    ctl = Controller(cfg, log=lambda m: None, sleep=lambda s: None, runner=runner,
+                     get_ipv4=lambda i: ("100.92.1.5", 16), session=session)
+    return ctl, seen
+
+
+def test_session_user_runs_netbird(tmp_path, runner):
+    ctl, seen = per_connect(tmp_path, runner)
+    ctl.bring_up()
+    assert seen == [("up", NOBODY_UID)]
+    assert ctl.state.get_user() == "nobody"
+
+
+def test_nobody_logged_in_means_root(tmp_path, runner):
+    ctl, seen = per_connect(tmp_path, runner, session=lambda: None)
+    ctl.bring_up()
+    assert seen == [("up", None)] and ctl.state.get_user() == "root"
+
+
+def test_user_is_decided_at_each_connect(tmp_path, runner):
+    who = ["nobody"]
+    ctl, seen = per_connect(tmp_path, runner, session=lambda: who[0])
+    ctl.bring_up()
+    who[0] = "daemon"                      # someone else logs in
+    ctl.bring_up()
+    assert [u for _, u in seen] == [NOBODY_UID, DAEMON_UID]
+
+
+def test_down_acts_for_the_user_who_connected(tmp_path, runner):
+    """Even if the desktop user changed in between; the down helper is a fresh process."""
+    who = ["nobody"]
+    ctl, seen = per_connect(tmp_path, runner, session=lambda: who[0])
+    ctl.bring_up()
+    who[0] = "daemon"
+    fresh, _ = per_connect(tmp_path, runner, session=lambda: who[0], seen=seen)
+    fresh.run_down()
+    assert seen[-1] == ("down", NOBODY_UID)
+
+
+def test_root_and_fixed_modes_ignore_the_session(tmp_path, runner):
+    ctl, seen = per_connect(tmp_path, runner, run_as="root")
+    ctl.bring_up()
+    ctl2, seen2 = per_connect(tmp_path / "b", runner, run_as="daemon")
+    ctl2.bring_up()
+    assert seen == [("up", None)]
+    assert seen2 == [("up", DAEMON_UID)]

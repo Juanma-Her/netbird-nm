@@ -350,38 +350,36 @@ def test_restart_reports_failure(monkeypatch):
     assert installer.restart_networkmanager() is True
 
 
-# -- 0.2.1: which user runs netbird ---------------------------------------------------------
+# -- which user runs netbird ------------------------------------------------------------------
 
-def test_pick_user_precedence(root, monkeypatch):
-    inst = make(root)
-    monkeypatch.delenv("SUDO_USER", raising=False)
-    assert inst.pick_user(None) == ""                     # plain root shell, nothing installed
+def test_default_is_session_user_not_installer(root, fake_netbird, monkeypatch):
+    """Installing through sudo must not pin the installing user."""
     monkeypatch.setenv("SUDO_USER", "nobody")
-    assert inst.pick_user(None) == "nobody"               # installed through sudo
-    assert inst.pick_user("") == ""                       # --as-root wins
-    assert inst.pick_user("daemon") == "daemon"           # --user wins
-    monkeypatch.setenv("SUDO_USER", "root")
-    assert inst.pick_user(None) == ""
+    make(root).install(opts(fake_netbird))
+    assert Config.load(root / "etc/netbird-nm.json").run_as == "session"
 
 
-def test_pick_user_keeps_earlier_choice_on_reinstall(root, fake_netbird, monkeypatch):
-    monkeypatch.delenv("SUDO_USER", raising=False)
+def test_pick_run_as(root, fake_netbird):
     inst = make(root)
-    inst.install(opts(fake_netbird, user="nobody"))
-    assert inst.pick_user(None) == "nobody"
+    assert inst.pick_run_as(None) == "session"
+    assert inst.pick_run_as("root") == "root"
+    assert inst.pick_run_as("nobody") == "nobody"
+    inst.install(opts(fake_netbird, run_as="nobody"))
+    assert inst.pick_run_as(None) == "nobody"          # reinstall keeps an explicit choice
+    inst.install(opts(fake_netbird, run_as="session"))
+    assert inst.pick_run_as(None) == "session"
 
 
-def test_install_records_user(root, fake_netbird):
-    make(root).install(opts(fake_netbird, user="nobody"))
-    assert Config.load(root / "etc/netbird-nm.json").user == "nobody"
+def test_upgrade_from_021_drops_pinned_user(root, fake_netbird):
+    """0.2.1 pinned the installing user under "user"; that key is now ignored."""
+    cfg = root / "etc/netbird-nm.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('{"netbird": "/usr/bin/netbird", "user": "juan", "iface": "wt0"}')
+    assert Config.load(cfg).run_as == "session"
+    make(root).install(opts(fake_netbird))
+    assert Config.load(cfg).run_as == "session"
 
 
 def test_install_rejects_unknown_user(root, fake_netbird):
     with pytest.raises(RuntimeError, match="no-such-user-xyz"):
-        make(root).install(opts(fake_netbird, user="no-such-user-xyz"))
-
-
-def test_older_config_without_user_means_root(tmp_path):
-    path = tmp_path / "c.json"
-    path.write_text('{"netbird": "/usr/bin/netbird", "iface": "wt0"}')
-    assert Config.load(path).user == ""
+        make(root).install(opts(fake_netbird, run_as="no-such-user-xyz"))

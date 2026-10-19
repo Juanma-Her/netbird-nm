@@ -231,7 +231,7 @@ class InstallOptions:
     iface: str | None = None
     netbird: str | None = None
     python: str | None = None
-    user: str | None = None          # run the netbird CLI as this user; "" = root, None = pick
+    run_as: str | None = None        # "session", "root" or a user name; None = keep / default
     restart_nm: bool = False         # restart NM if it can't see the plugin otherwise
     manage_system: bool = True       # reload D-Bus/NM, enable dispatcher; off in tests
 
@@ -330,15 +330,12 @@ class Installer:
             raise RuntimeError(f"nmcli could not create the connection: {r.stderr.strip()}")
         return "created"
 
-    def pick_user(self, requested: str | None) -> str:
-        """Who runs the netbird CLI: --user / --as-root, else whoever ran the
-        installer through sudo, else what an earlier install chose, else root."""
+    def pick_run_as(self, requested: str | None) -> str:
+        """--user NAME / --as-root if given, else what an earlier install
+        chose, else "session" (whoever is logged in, decided at each connect)."""
         if requested is not None:
             return requested
-        sudo_user = os.environ.get("SUDO_USER", "")
-        if sudo_user and sudo_user != "root":
-            return sudo_user
-        return Config.load(self.layout.p(self.layout.config)).user
+        return Config.load(self.layout.p(self.layout.config)).run_as
 
     @staticmethod
     def check_user_can_reach_netbird(netbird: str, run_as: RunAs) -> str:
@@ -362,17 +359,22 @@ class Installer:
         python = opts.python or find_python()
         if not python:
             raise RuntimeError("no Python with the libnm GObject bindings was found")
-        user = self.pick_user(opts.user)
-        if user:
-            try:
-                run_as = RunAs.lookup(user)
-            except KeyError:
-                raise RuntimeError(f"user {user!r} doesn't exist") from None
-        cfg = Config(netbird=netbird, user=user, iface=opts.iface or detect_iface())
+        from .controller import resolve_user
 
-        result: dict = {"netbird": netbird, "python": python, "iface": cfg.iface, "user": user}
-        if user and opts.manage_system:
-            result["user_check"] = self.check_user_can_reach_netbird(netbird, run_as)
+        run_as = self.pick_run_as(opts.run_as)
+        if run_as not in ("session", "root"):
+            try:
+                RunAs.lookup(run_as)
+            except KeyError:
+                raise RuntimeError(f"user {run_as!r} doesn't exist") from None
+        cfg = Config(netbird=netbird, run_as=run_as, iface=opts.iface or detect_iface())
+
+        # Who that means right now (for "session": whoever is logged in).
+        now = resolve_user(cfg)
+        result: dict = {"netbird": netbird, "python": python, "iface": cfg.iface,
+                        "run_as": run_as, "user_now": now}
+        if now and opts.manage_system:
+            result["user_check"] = self.check_user_can_reach_netbird(netbird, RunAs.lookup(now))
         result["legacy"] = [str(p) for p in self.remove_legacy()]
         if self.remove_legacy_dummy(opts.name):
             result["legacy"].append(f"dummy connection '{opts.name}'")
@@ -451,6 +453,7 @@ class Installer:
         so it gets the address back. True if it had to."""
         from .controller import make_netbird
         from .netbird import iface_exists, iface_ipv4
+        from .state import StateDir
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:          # NM strips it shortly after 'down'
             if not iface_exists(cfg.iface):
@@ -460,8 +463,10 @@ class Installer:
             time.sleep(0.5)
         else:
             return False                            # address still there
+        # act for whoever the connection was acting for
+        user = StateDir(cfg.state_dir).get_user()
         try:
-            nb = make_netbird(cfg)
+            nb = make_netbird(cfg, "" if user in (None, "root") else user)
         except KeyError:
             nb = NetBird(cfg.netbird)
         nb.down()

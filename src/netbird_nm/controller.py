@@ -12,6 +12,7 @@ from typing import Callable
 
 from .config import Config
 from .netbird import NetBird, RunAs, iface_exists, iface_ipv4, summarize
+from .session import session_user
 from .state import StateDir
 
 Log = Callable[[str], None]
@@ -53,9 +54,18 @@ def vpn_config(t: TunnelInfo) -> tuple[dict, dict]:
     return config, ip4
 
 
-def make_netbird(cfg: Config) -> NetBird:
-    """The netbird CLI wrapper for this config. KeyError if cfg.user is unknown."""
-    return NetBird(cfg.netbird, run_as=RunAs.lookup(cfg.user) if cfg.user else None)
+def resolve_user(cfg: Config, session: Callable[[], str | None] = session_user) -> str:
+    """Who should run the netbird CLI right now; "" means root."""
+    if cfg.run_as == "root":
+        return ""
+    if cfg.run_as == "session":
+        return session() or ""
+    return cfg.run_as
+
+
+def make_netbird(cfg: Config, user: str, runner=subprocess.run) -> NetBird:
+    """KeyError if ``user`` doesn't exist."""
+    return NetBird(cfg.netbird, runner, run_as=RunAs.lookup(user) if user else None)
 
 
 class Controller:
@@ -65,34 +75,42 @@ class Controller:
                  now: Callable[[], float] = time.monotonic,
                  get_ipv4: Callable[[str], tuple[str, int] | None] = iface_ipv4,
                  exists: Callable[[str], bool] = iface_exists,
-                 ip_runner=subprocess.run):
+                 session: Callable[[], str | None] = session_user,
+                 runner=subprocess.run, ip_runner=subprocess.run):
         self.cfg = cfg
-        self.setup_error = ""
-        if netbird is None:
-            try:
-                netbird = make_netbird(cfg)
-            except KeyError:
-                self.setup_error = (f"user {cfg.user!r} from /etc/netbird-nm.json doesn't exist; "
-                                    "reinstall with --user NAME")
-                netbird = NetBird(cfg.netbird)        # root, so 'down' still works
-        self.netbird = netbird
+        self.fixed_netbird = netbird          # tests pass one in; otherwise chosen per connect
+        self.runner = runner
+        self.netbird = netbird or NetBird(cfg.netbird, runner)
         self.state = state or StateDir(cfg.state_dir)
         self.log = log
         self.sleep = sleep
         self.now = now
         self.get_ipv4 = get_ipv4
         self.exists = exists
+        self.session = session
         self.ip_runner = ip_runner
 
     @property
     def who(self) -> str:
         return self.netbird.run_as.name if self.netbird.run_as else "root"
 
+    def _choose_netbird(self, user: str | None = None) -> None:
+        """Point self.netbird at the user to act for. ``user`` None = resolve now."""
+        if self.fixed_netbird:
+            self.netbird = self.fixed_netbird
+            return
+        if user is None:
+            user = resolve_user(self.cfg, self.session)
+        try:
+            self.netbird = make_netbird(self.cfg, user, self.runner)
+        except KeyError:
+            raise ConnectError(f"user {user!r} doesn't exist (run_as in /etc/netbird-nm.json)") from None
+
     # connect ----------------------------------------------------------------
     def bring_up(self) -> TunnelInfo:
         """Run 'netbird up' and wait for the interface. Blocking."""
-        if self.setup_error:
-            raise ConnectError(self.setup_error)
+        self._choose_netbird()
+        self.state.set_user(self.who)         # the matching 'down' acts for the same user
         start = self.now()
         deadline = start + self.cfg.connect_timeout
         if not self.state.wait_down_done(timeout=40, sleep=self.sleep):
@@ -186,7 +204,13 @@ class Controller:
                         break
                     self.sleep(0.25)
                     waited += 0.25
-                self.log("running netbird down")
+                remembered = self.state.get_user()
+                try:
+                    self._choose_netbird(None if remembered is None else
+                                         ("" if remembered == "root" else remembered))
+                except ConnectError:
+                    self.netbird = NetBird(self.cfg.netbird, self.runner)    # fall back to root
+                self.log(f"running netbird down (as {self.who})")
                 try:
                     self.netbird.down()
                 except (OSError, subprocess.TimeoutExpired) as e:

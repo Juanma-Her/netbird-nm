@@ -5,6 +5,7 @@ resume        the VPN was dropped by a network change; re-activate it when a
               network is back, and keep NetBird running meanwhile
 keep-running  set by uninstall: don't stop NetBird while removing the profile
 down-pending  a 'netbird down' is queued; a new 'up' must wait for it
+user          who the current connection runs netbird as, for the matching 'down'
 lock          serializes 'netbird up' / 'netbird down'
 """
 
@@ -52,6 +53,16 @@ class StateDir:
         self._remove("resume")
         return uuid or None
 
+    # user: who the current connection acts for ("root" or a user name) -------
+    def set_user(self, name: str) -> None:
+        self._touch("user", name)
+
+    def get_user(self) -> str | None:
+        try:
+            return self._file("user").read_text().strip() or None
+        except FileNotFoundError:
+            return None
+
     # keep-running -------------------------------------------------------------
     def set_keep(self) -> None:
         self._touch("keep-running")
@@ -92,7 +103,7 @@ class StateDir:
                 fcntl.flock(fd, fcntl.LOCK_UN)
 
     def wipe(self) -> None:
-        for name in ("resume", "keep-running", "down-pending", "lock"):
+        for name in ("resume", "keep-running", "down-pending", "lock", "user"):
             self._remove(name)
         with contextlib.suppress(OSError):
             os.rmdir(self.path)
