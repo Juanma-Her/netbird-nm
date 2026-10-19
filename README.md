@@ -45,8 +45,9 @@ Options:
 | `--name NAME` | connection name (default `NetBird`) |
 | `--iface IFACE` | NetBird's interface (default: read from `/etc/netbird/config.json`, else `wt0`) |
 | `--netbird PATH` | the netbird binary (default: from `PATH`) |
-| `--user NAME` | run the `netbird` command as this user (default: you, when installing through sudo) |
-| `--as-root` | run the `netbird` command as root instead |
+| `--user NAME` | always run the `netbird` command as this user |
+| `--as-root` | always run the `netbird` command as root |
+| `--session-user` | back to the default: whoever is logged in, at each connect |
 | `--restart-nm` / `--no-restart-nm` | restart NetworkManager if it's needed, without asking / never |
 | `--no-deps` | don't install missing Python bindings |
 | `-y` | answer yes to questions |
@@ -54,11 +55,20 @@ Options:
 ### Which user runs `netbird`
 
 NetworkManager starts every VPN plugin as root, but the plugin doesn't run
-the `netbird` command as root: it switches to your user first (or whichever
-`--user` you gave). That command only asks NetBird's own daemon, a separate
-root service, to connect or disconnect, so it needs no privileges, and this
-way it acts on exactly the same NetBird profile as `netbird` in your terminal.
-`install` and `doctor` check that this user can reach the daemon.
+the `netbird` command as root. Each time the VPN is turned on, it runs it as
+**whoever is logged in on the desktop at that moment**, the person clicking
+the toggle, and the matching disconnect acts for that same user. That command
+only asks NetBird's own daemon, a separate root service, to connect or
+disconnect, so it needs no privileges, and this way it acts on the same
+NetBird profile as `netbird` in that user's terminal.
+
+NetworkManager doesn't tell VPN plugins which user asked for a connection,
+so "logged in" means the active session on the main seat according to
+systemd-logind (or, without a seat, the only user with an active session).
+When nobody is logged in, e.g. at boot, `netbird` runs as root. Nothing is
+decided at install time; `--user` or `--as-root` pin it if you prefer.
+`install` and `doctor` show who it would be right now and check that this
+user can reach NetBird's daemon.
 
 ## Use
 
@@ -111,9 +121,9 @@ journalctl -t nm-netbird -f  # plugin and dispatcher logs
 - **Connecting times out**: NetBird probably isn't logged in. Run `netbird up`
   once in a terminal. The log shows what `netbird up` and `netbird status`
   printed.
-- **"'netbird status' failed as <user>"** during install: that user can't
-  control NetBird's daemon. Reinstall with `--user` someone who can, or
-  `--as-root`.
+- **"'netbird status' failed as <user>"** during install or in `doctor`:
+  that user can't control NetBird's daemon. Reinstall with `--user` someone
+  who can, or `--as-root`.
 
 ## How it works
 

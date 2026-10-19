@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- The `netbird` command now runs as **whoever is logged in on the desktop
+  when the VPN is turned on** (the active systemd-logind session), instead of
+  the user who ran `install`. The matching disconnect acts for the same user,
+  and with nobody logged in it runs as root. Nothing is pinned at install
+  time; `--user NAME` / `--as-root` still pin it, `--session-user` undoes that.
+  Upgrading from 0.2.1 switches to the new default.
+
 ## 0.2.1
 
 - **Fixed**: connecting failed with "interface wt0 never got an IPv4 address"
