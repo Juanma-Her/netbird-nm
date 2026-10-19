@@ -1,0 +1,35 @@
+#!/bin/sh
+# Stand-in for the netbird CLI in integration tests: "up" creates a TUN
+# interface with a 100.x address, "down" removes it.
+#   FAKE_NETBIRD_IFACE  interface name (default wt0)
+#   $STATE/fail         if present, "up" fails like a logged-out client
+#   $STATE/log          every call is appended here with a timestamp
+STATE=${FAKE_NETBIRD_STATE:-/tmp/fake-netbird}
+IF=${FAKE_NETBIRD_IFACE:-wt0}
+mkdir -p "$STATE"
+echo "$(date +%T.%N | cut -c1-12) $*" >> "$STATE/log"
+
+case "$1" in
+    up)
+        if [ -e "$STATE/fail" ]; then
+            echo "Error: not logged in, run netbird login" >&2
+            exit 1
+        fi
+        sleep 1
+        ip link show "$IF" >/dev/null 2>&1 || ip tuntap add dev "$IF" mode tun
+        ip addr replace 100.92.1.5/16 dev "$IF"
+        ip link set "$IF" up
+        echo "Connected" ;;
+    down)
+        sleep 1
+        ip link del "$IF" 2>/dev/null
+        echo "Disconnected" ;;
+    status)
+        if ip link show "$IF" >/dev/null 2>&1; then echo "Management: Connected"
+        else echo "Daemon status: Idle"; fi ;;
+    version)
+        echo "0.0.0-fake" ;;
+    *)
+        echo "fake-netbird: unsupported command $1" >&2
+        exit 2 ;;
+esac
