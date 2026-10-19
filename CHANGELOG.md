@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0
+
+Two ideas borrowed from
+[groundbasesoft/netbird-network-manager-vpn-plugin](https://github.com/groundbasesoft/netbird-network-manager-vpn-plugin):
+
+- **Talks to NetBird's daemon directly** over its gRPC socket (`Status`,
+  `GetActiveProfile`, `Login`, `Up`, `Down`, `GetConfig`) instead of running
+  the `netbird` command and parsing its output. Still done as the logged-in
+  user, in a separate process, so the daemon sees the same caller as before.
+  Needs Python's grpcio (`python-grpcio`); without it, `--backend cli` keeps
+  using the `netbird` command. Verified against the real NetBird 0.81.2 daemon.
+- **No IP configuration is reported to NetworkManager.** NetBird owns its
+  addresses, routes and DNS; NetworkManager now leaves them alone, so it no
+  longer strips NetBird's address when the VPN goes down. The VPN's gateway
+  is NetBird's management server instead of our own tunnel address.
+- New install options: `--backend`, `--daemon-addr`, `--vpn-dir`. The README
+  explains how the VPN plugin directory is chosen.
+
 ## 0.3.0
 
 - The `netbird` command now runs as **whoever is logged in on the desktop
