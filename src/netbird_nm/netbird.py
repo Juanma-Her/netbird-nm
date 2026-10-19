@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pwd
 import subprocess
@@ -41,14 +42,23 @@ class RunAs:
 
 
 class NetBird:
-    def __init__(self, binary: str, runner: Runner = subprocess.run, run_as: RunAs | None = None):
+    """Runs NetBird commands, as ``run_as`` (or root).
+
+    ``command`` is what to run: the netbird CLI (backend "cli"), or this
+    package's own gRPC client, netbird_nm.daemon (backend "grpc"). Both take
+    up / down / status."""
+
+    def __init__(self, binary: str, runner: Runner = subprocess.run, run_as: RunAs | None = None,
+                 command: list[str] | None = None, backend: str = "cli"):
         self.binary = binary
+        self.command = command or [binary]
+        self.backend = backend
         self.runner = runner
         self.run_as = run_as
 
     def _run(self, *args: str, timeout: float) -> subprocess.CompletedProcess[str]:
         kw = self.run_as.subprocess_kwargs() if self.run_as else {}
-        return self.runner([self.binary, *args], capture_output=True, text=True,
+        return self.runner([*self.command, *args], capture_output=True, text=True,
                            timeout=timeout, **kw)
 
     def up(self, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -59,6 +69,22 @@ class NetBird:
 
     def status(self, timeout: float = 10) -> subprocess.CompletedProcess[str]:
         return self._run("status", timeout=timeout)
+
+    def status_info(self, timeout: float = 10) -> dict:
+        """{"status", "management_url", "ip", ...}; {} if it can't be read."""
+        args = ("status",) if self.backend == "grpc" else ("status", "--json")
+        try:
+            r = self._run(*args, timeout=timeout)
+            data = json.loads(r.stdout) if r.returncode == 0 else {}
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        if self.backend == "grpc":
+            return data
+        mgmt = data.get("management") if isinstance(data.get("management"), dict) else {}
+        return {"status": data.get("daemonStatus", ""), "management_url": mgmt.get("url", ""),
+                "ip": data.get("netbirdIp", ""), "fqdn": data.get("fqdn", "")}
 
 
 def iface_exists(iface: str, sysfs: str = "/sys/class/net") -> bool:

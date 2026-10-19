@@ -92,9 +92,7 @@ def _make_plugin_class():
         def _report(self, info: TunnelInfo):
             if self.stopping:
                 return False
-            config, ip4 = vpn_config(info)
-            self.set_config(variant_dict(config))
-            self.set_ip4_config(variant_dict(ip4))
+            self.set_config(variant_dict(vpn_config(info, info.gateway)))
             dog = Watchdog(self.ctl.tunnel_alive)
             self.watch_id = GLib.timeout_add_seconds(self.ctl.cfg.watch_interval,
                                                      self._watch, dog)

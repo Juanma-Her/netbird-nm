@@ -27,6 +27,7 @@ class TunnelInfo:
     iface: str
     address: str
     prefix: int
+    gateway: str | None = None      # NetBird's management server, for NM
 
 
 def ip_to_u32(addr: str) -> int:
@@ -34,24 +35,53 @@ def ip_to_u32(addr: str) -> int:
     return struct.unpack("=I", socket.inet_aton(addr))[0]
 
 
-def vpn_config(t: TunnelInfo) -> tuple[dict, dict]:
-    """The generic and IPv4 config dicts reported to NM (plain Python values)."""
-    a32 = ip_to_u32(t.address)
-    config = {
-        # NM insists on a "VPN gateway". NetBird is a mesh with no single
-        # gateway, so report our own tunnel address; the host route NM adds
-        # for it is harmless because the kernel's local table wins.
-        "gateway": ("u", a32),
+def vpn_config(t: TunnelInfo, gateway: str | None = None) -> dict:
+    """The config reported to NM (plain Python values).
+
+    No IP configuration: NetBird owns the interface's address, routes and DNS,
+    so NM is told there's nothing for it to manage (has-ip4/has-ip6 false).
+    That also stops NM from removing NetBird's address when the VPN goes down.
+    NM still insists on an external "gateway": the NetBird management server
+    (NM keeps a route to it via the physical network, which is correct), or
+    our tunnel address if that can't be resolved."""
+    return {
+        "gateway": ("u", ip_to_u32(gateway or t.address)),
         "tundev": ("s", t.iface),
-        "has-ip4": ("b", True),
+        "has-ip4": ("b", False),
         "has-ip6": ("b", False),
     }
-    ip4 = {
-        "address": ("u", a32),
-        "prefix": ("u", t.prefix),
-        "never-default": ("b", True),   # NetBird manages its own routes
-    }
-    return config, ip4
+
+
+def resolve_ipv4(url: str, timeout: float = 3.0) -> str | None:
+    """IPv4 address of the host in ``url`` (e.g. https://api.netbird.io:443)."""
+    import threading
+    from urllib.parse import urlsplit
+    host = urlsplit(url if "//" in url else "//" + url).hostname
+    if not host:
+        return None
+    result: list[str] = []
+
+    def lookup():
+        try:
+            result.append(socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0])
+        except (OSError, IndexError):
+            pass
+    t = threading.Thread(target=lookup, daemon=True)
+    t.start()
+    t.join(timeout)
+    return result[0] if result else None
+
+
+GRPC_BOOT = ("import sys; sys.path.insert(0, {lib!r}); "
+             "from netbird_nm.daemon import main; sys.exit(main())")
+
+
+def grpc_command(cfg: Config, python: str | None = None, lib: str | None = None) -> list[str]:
+    """How to run netbird_nm.daemon (the gRPC client) in a separate process."""
+    import sys
+    from pathlib import Path
+    lib = lib or str(Path(__file__).resolve().parent.parent)
+    return [python or sys.executable, "-c", GRPC_BOOT.format(lib=lib), "--addr", cfg.daemon_addr]
 
 
 def resolve_user(cfg: Config, session: Callable[[], str | None] = session_user) -> str:
@@ -63,9 +93,14 @@ def resolve_user(cfg: Config, session: Callable[[], str | None] = session_user) 
     return cfg.run_as
 
 
-def make_netbird(cfg: Config, user: str, runner=subprocess.run) -> NetBird:
+def make_netbird(cfg: Config, user: str, runner=subprocess.run, *,
+                 python: str | None = None, lib: str | None = None) -> NetBird:
     """KeyError if ``user`` doesn't exist."""
-    return NetBird(cfg.netbird, runner, run_as=RunAs.lookup(user) if user else None)
+    run_as = RunAs.lookup(user) if user else None
+    if cfg.backend == "grpc":
+        return NetBird(cfg.netbird, runner, run_as, command=grpc_command(cfg, python, lib),
+                       backend="grpc")
+    return NetBird(cfg.netbird, runner, run_as)
 
 
 class Controller:
@@ -138,17 +173,19 @@ class Controller:
             ip = self.get_ipv4(self.cfg.iface)
             if not ip and already and not restarted and self.now() - up_done >= 3 \
                     and self.exists(self.cfg.iface):
-                # NetworkManager removes the address it configured on the
-                # tunnel when the VPN goes down. If NetBird kept running
-                # (network change, uninstall, an earlier version), it's left
-                # "connected" with no address, and 'netbird up' won't fix that.
-                self.log(f"NetBird is connected but {self.cfg.iface} has no IPv4 address "
-                         "(NetworkManager removes it when the VPN goes down); restarting NetBird")
+                # Safety net. Since 0.4 NM manages no IP on the tunnel, so it
+                # no longer strips NetBird's address. But a NetBird left
+                # running by an earlier version (or anything else that flushed
+                # the address) is "connected" with no address, and 'netbird
+                # up' alone won't fix that.
+                self.log(f"NetBird is connected but {self.cfg.iface} has no IPv4 address; "
+                         "restarting NetBird")
                 self.restart_netbird(deadline)
                 restarted = True
                 continue
             if ip:
                 info = TunnelInfo(self.cfg.iface, *ip)
+                info.gateway = self.find_gateway()
                 self.log(f"up: {info.address}/{info.prefix} on {info.iface} "
                          f"after {self.now() - start:.1f}s")
                 return info
@@ -158,6 +195,13 @@ class Controller:
         self.log_diagnostics()
         raise ConnectError(f"interface {self.cfg.iface} had no IPv4 address "
                            f"{self.now() - start:.0f}s after connecting started")
+
+    def find_gateway(self) -> str | None:
+        url = self.netbird.status_info().get("management_url", "")
+        gw = resolve_ipv4(url) if url else None
+        if url and not gw:
+            self.log(f"couldn't resolve the management server {url}; using the tunnel address instead")
+        return gw
 
     def restart_netbird(self, deadline: float) -> None:
         with self.state.lock():

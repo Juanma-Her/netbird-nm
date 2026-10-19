@@ -14,9 +14,14 @@ NOBODY_UID = pwd.getpwnam("nobody").pw_uid
 DAEMON_UID = pwd.getpwnam("daemon").pw_uid
 
 
+def nb_calls(runner):
+    """netbird invocations other than the status lookups."""
+    return [c for c in runner.calls if c[0] == "/bin/netbird" and c[1] != "status"]
+
+
 def make(tmp_path, runner, sleep, ipv4=("100.92.1.5", 16), **cfg):
     """A controller on a fake clock: time only moves when it sleeps."""
-    config = Config(netbird="/bin/netbird", state_dir=str(tmp_path / "run"), **cfg)
+    config = Config(netbird="/bin/netbird", backend="cli", state_dir=str(tmp_path / "run"), **cfg)
     logs = []
     elapsed = [0.0]
 
@@ -36,8 +41,8 @@ def make(tmp_path, runner, sleep, ipv4=("100.92.1.5", 16), **cfg):
 def test_bring_up_runs_netbird_and_reports_address(tmp_path, runner, clock):
     ctl, logs = make(tmp_path, runner, clock)
     info = ctl.bring_up()
-    assert runner.calls == [["/bin/netbird", "up"]]
-    assert info == TunnelInfo("wt0", "100.92.1.5", 16)
+    assert nb_calls(runner) == [["/bin/netbird", "up"]]
+    assert (info.iface, info.address, info.prefix) == ("wt0", "100.92.1.5", 16)
     assert any(m.startswith("up: 100.92.1.5/16 on wt0") for m in logs)
 
 
@@ -52,7 +57,7 @@ def test_bring_up_waits_for_pending_down(tmp_path, runner):
     ctl.state.mark_down_pending()
     ctl.bring_up()
     assert len(pending) == 4      # waited until the marker went away, then ran up
-    assert runner.calls == [["/bin/netbird", "up"]]
+    assert nb_calls(runner) == [["/bin/netbird", "up"]]
 
 
 def test_bring_up_failure_message(tmp_path, runner, clock):
@@ -143,13 +148,32 @@ def test_ip_to_u32_is_network_byte_order():
     assert struct.pack("=I", ip_to_u32("100.92.1.5")) == socket.inet_aton("100.92.1.5")
 
 
-def test_vpn_config_contents():
-    config, ip4 = vpn_config(TunnelInfo("wt0", "100.92.1.5", 16))
+def test_vpn_config_reports_no_ip_configuration():
+    """NetBird owns addresses/routes/DNS; NM must not manage (or remove) them."""
+    config = vpn_config(TunnelInfo("wt0", "100.92.1.5", 16), gateway="198.51.100.10")
     assert config["tundev"] == ("s", "wt0")
+    assert config["has-ip4"] == ("b", False) and config["has-ip6"] == ("b", False)
+    assert config["gateway"] == ("u", ip_to_u32("198.51.100.10"))
+
+
+def test_vpn_config_gateway_falls_back_to_tunnel_address():
+    config = vpn_config(TunnelInfo("wt0", "100.92.1.5", 16))
     assert config["gateway"] == ("u", ip_to_u32("100.92.1.5"))
-    assert config["has-ip4"] == ("b", True) and config["has-ip6"] == ("b", False)
-    assert ip4["prefix"] == ("u", 16)
-    assert ip4["never-default"] == ("b", True)   # don't hijack the default route
+
+
+def test_gateway_is_the_management_server(tmp_path, runner, clock):
+    runner.on(["/bin/netbird", "status", "--json"],
+              stdout='{"daemonStatus": "Connected", "management": {"url": "https://127.0.0.7:443"}}')
+    ctl, _ = make(tmp_path, runner, clock)
+    assert ctl.bring_up().gateway == "127.0.0.7"
+
+
+def test_unresolvable_management_server_is_logged(tmp_path, runner, clock):
+    runner.on(["/bin/netbird", "status", "--json"],
+              stdout='{"management": {"url": "https://does-not-exist.invalid"}}')
+    ctl, logs = make(tmp_path, runner, clock)
+    assert ctl.bring_up().gateway is None
+    assert any("couldn't resolve the management server" in m for m in logs)
 
 
 # -- watchdog --------------------------------------------------------------------------
@@ -217,7 +241,7 @@ def test_restarts_netbird_left_without_its_address(tmp_path, runner, clock):
     ctl, logs = make(tmp_path, runner, clock,
                      ipv4=lambda iface: ("100.92.1.5", 16) if restarted else None)
     assert ctl.bring_up().address == "100.92.1.5"
-    assert [c[1] for c in runner.calls if c[0] == "/bin/netbird"] == ["up", "down", "up"]
+    assert [c[1] for c in nb_calls(runner)] == ["up", "down", "up"]
     assert any("restarting NetBird" in m for m in logs)
 
 
@@ -225,7 +249,7 @@ def test_slow_fresh_connect_is_not_restarted(tmp_path, runner, clock):
     answers = iter([None] * 20 + [("100.92.1.5", 16)])   # 10s, no "Already connected"
     ctl, _ = make(tmp_path, runner, clock, ipv4=lambda iface: next(answers))
     ctl.bring_up()
-    assert [c[1] for c in runner.calls if c[0] == "/bin/netbird"] == ["up"]
+    assert [c[1] for c in nb_calls(runner)] == ["up"]
 
 
 def test_restart_happens_only_once(tmp_path, runner, clock):
@@ -233,7 +257,7 @@ def test_restart_happens_only_once(tmp_path, runner, clock):
     ctl, _ = make(tmp_path, runner, clock, ipv4=lambda iface: None)
     with pytest.raises(ConnectError):
         ctl.bring_up()
-    assert [c[1] for c in runner.calls if c[0] == "/bin/netbird"].count("down") == 1
+    assert [c[1] for c in nb_calls(runner)].count("down") == 1
 
 
 def test_restart_failure_is_reported(tmp_path, runner, clock):
@@ -254,10 +278,12 @@ def per_connect(tmp_path, runner, run_as="session", session=lambda: "nobody", se
     seen = [] if seen is None else seen
 
     def record(cmd, **kw):
-        seen.append((cmd[1], kw.get("user")))
+        if cmd[1] != "status":
+            seen.append((cmd[1], kw.get("user")))
         return ("Connected\n" if cmd[1] == "up" else "", 0, "")
     runner.on(["/bin/netbird"], action=record)
-    cfg = Config(netbird="/bin/netbird", run_as=run_as, state_dir=str(tmp_path / "run"), down_grace=0)
+    cfg = Config(netbird="/bin/netbird", backend="cli", run_as=run_as,
+                 state_dir=str(tmp_path / "run"), down_grace=0)
     ctl = Controller(cfg, log=lambda m: None, sleep=lambda s: None, runner=runner,
                      get_ipv4=lambda i: ("100.92.1.5", 16), session=session)
     return ctl, seen
