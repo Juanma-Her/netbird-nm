@@ -1,0 +1,139 @@
+# netbird-nm
+
+Control [NetBird](https://netbird.io) from NetworkManager as a regular VPN
+connection: it shows up in nm-applet, GNOME/KDE network menus, Quickshell or
+Waybar bars that go through `nmcli`, and `nmcli connection up/down` itself.
+
+```
+$ nmcli connection show
+NAME     UUID                                  TYPE  DEVICE
+Home     8c1e…                                 wifi  wlan0
+NetBird  f1b1c765-5607-47b7-99b6-446628f2baf3  vpn   wlan0
+```
+
+## Why
+
+NetBird manages its own WireGuard interface (`wt0`). NetworkManager notices it
+and shows it as an "externally connected" device. If you switch that off from
+NetworkManager it tears the interface down, but has no way to bring it back:
+only `netbird down && netbird up` recovers.
+
+netbird-nm adds a small NetworkManager **VPN plugin** for NetBird instead.
+Turning the "NetBird" VPN connection on runs `netbird up`; turning it off runs
+`netbird down`. NetBird's own interface is hidden from NetworkManager so the
+broken toggle disappears.
+
+## Install
+
+Requirements: NetworkManager, NetBird (logged in once with `netbird up`), and
+the Python GObject bindings for libnm (`python-gobject` + `libnm` on Arch,
+`python3-gi` + `gir1.2-nm-1.0` on Debian/Ubuntu). The installer offers to
+install the bindings if they're missing.
+
+```sh
+git clone <this repo> && cd netbird-nm
+./netbird-nm install          # asks for sudo
+```
+
+That's all: "NetBird" now appears among your VPN connections. No pip install
+is needed; the installer copies the package to `/usr/local/lib/netbird-nm`.
+
+Options:
+
+| option | |
+|---|---|
+| `--name NAME` | connection name (default `NetBird`) |
+| `--iface IFACE` | NetBird's interface (default: read from `/etc/netbird/config.json`, else `wt0`) |
+| `--netbird PATH` | the netbird binary (default: from `PATH`) |
+| `--restart-nm` / `--no-restart-nm` | restart NetworkManager if it's needed, without asking / never |
+| `--no-deps` | don't install missing Python bindings |
+| `-y` | answer yes to questions |
+
+## Use
+
+Toggle "NetBird" in your network menu, or:
+
+```sh
+nmcli connection up NetBird
+nmcli connection down NetBird
+```
+
+What happens around that:
+
+- **NetBird stopped outside NetworkManager** (CLI, tray app): the VPN is shown
+  as off within a few seconds.
+- **Switching Wi-Fi networks or unplugging the cable**: NetworkManager drops
+  every VPN when the connection under it goes away. NetBird keeps running
+  through the gap and the VPN is shown as on again once the new network is up.
+- **Switching it off yourself** sticks, even across network changes.
+- **At boot**, if NetBird's own service already connected, the VPN is shown
+  as on about ten seconds after the network comes up.
+
+## Uninstall
+
+```sh
+./netbird-nm uninstall              # NetBird stays connected if it was
+./netbird-nm uninstall --stop-netbird
+```
+
+Uninstall only removes files that carry netbird-nm's marker, and also cleans
+up files from the earlier single-script version (`netbird-nm-vpn.sh`).
+
+## Troubleshooting
+
+```sh
+./netbird-nm status          # what's installed, connection state
+./netbird-nm doctor          # checks for common problems
+./netbird-nm doctor --live   # also toggles the VPN to prove NM can drive it
+journalctl -t nm-netbird -f  # plugin and dispatcher logs
+```
+
+- **"The VPN service 'org.freedesktop.NetworkManager.netbird' was not
+  installed"**: NetworkManager only watches VPN plugin directories that
+  existed when it started. netbird-nm puts its plugin description in
+  `/usr/lib/NetworkManager/VPN`, which NetworkManager packages ship; if your
+  system has neither that nor `/etc/NetworkManager/VPN`, the installer offers
+  to restart NetworkManager. `sudo systemctl restart NetworkManager` also fixes it.
+- **The VPN doesn't come back after a Wi-Fi switch**: the dispatcher service
+  must be enabled. The installer does this; check with
+  `systemctl is-enabled NetworkManager-dispatcher.service`.
+- **Connecting times out**: NetBird probably isn't logged in. Run `netbird up`
+  once in a terminal.
+
+## How it works
+
+| piece | installed as | role |
+|---|---|---|
+| `service.py` | `/usr/local/libexec/nm-netbird-service` | the VPN plugin NetworkManager starts: `netbird up` on connect, a detached helper runs `netbird down` on disconnect, and a watchdog notices NetBird stopping on its own |
+| `nm-netbird-service.name` | `/usr/lib/NetworkManager/VPN/` | tells NetworkManager the plugin exists |
+| D-Bus policy | `/etc/dbus-1/system.d/nm-netbird-service.conf` | lets the plugin own its bus name |
+| `dispatcher.py` | `/etc/NetworkManager/dispatcher.d/90-netbird-vpn` | handles network changes and adopting an already running NetBird |
+| keyfile conf | `/etc/NetworkManager/conf.d/99-netbird-unmanaged.conf` | hides `wt0` from NetworkManager |
+| config | `/etc/netbird-nm.json` | netbird path, interface and timings |
+
+The plugin reports NetBird's IPv4 address to NetworkManager with
+`never-default`, and no DNS, so NetBird keeps managing its own routes and DNS.
+
+The connection logic (`controller.py`, `dispatcher.py`, `state.py`) has no
+GObject dependency and is unit-tested on its own; `service.py` is the thin
+libnm adapter.
+
+## Development
+
+```sh
+pip install -e '.[dev]'      # or just have pytest and ruff around
+make lint test               # ruff + unit tests, no root needed
+```
+
+Integration tests run the real installer against a real NetworkManager with
+a fake `netbird`. They start their own NetworkManager, so only run them in a
+throwaway root container or VM; see [tests/integration/README.md](tests/integration/README.md).
+
+## Limitations
+
+- IPv4 only is reported to NetworkManager; NetBird's IPv6 setup is untouched.
+- There is no GUI editor plugin, so "Configure VPN…" can't edit the
+  connection; use `nmcli connection modify NetBird …` if you ever need to.
+- Toggling from a script faster than about 50 ms can be rejected by
+  NetworkManager itself ("VPN service stopped unexpectedly"). NetworkManager
+  and NetBird still end up agreeing; clicking in a menu never hits this.

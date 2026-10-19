@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install pytest ruff
+      - run: ruff check .
+      - run: python -m pytest
+
+  integration:
+    # A real NetworkManager inside a throwaway privileged container.
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run against NetworkManager
+        run: |
+          docker run --rm --privileged -v "$PWD:/src" -w /src ubuntu:24.04 sh -c '
+            sh tests/integration/sandbox.sh deps &&
+            sh tests/integration/sandbox.sh start &&
+            NETBIRD_NM_INTEGRATION=1 python3 -m pytest tests/integration -m integration -v -p no:cacheprovider'
